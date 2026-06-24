@@ -1,507 +1,758 @@
-# Isolate replacement cache entries and retain ownership of detached async tasks
+# Make registry updates independent of prior crawling
 
-`async-lru` allows an in-flight cached call to be removed from the cache through explicit invalidation, cache clearing, or normal eviction. Removing an entry from the cache lookup does not necessarily stop the underlying asynchronous computation.
+A `Registry` lazily discovers resource identifiers, subresources, and anchors when it is crawled or queried.
 
-A later call using the same arguments may therefore create a replacement cache entry while the earlier computation is still running. The earlier entry is considered **detached**: it is no longer available for cache lookup, but its task may still have active callers and remains part of the cache's lifecycle until it reaches a terminal state.
+Updating a registry after discovery has occurred must not leave it with resolution results belonging to resources that have since been replaced. The observable contents of a registry should depend on its current registrations and their precedence, not on whether earlier versions happened to be crawled.
 
-Update the cache lifecycle so that detached calls cannot corrupt replacement entries and do not become unmanaged.
+Update registry mutation and combination behavior so that replacing resources remains consistent with lazy discovery.
 
-## Replacement entry isolation
+## Required behavior
 
-Once an in-flight entry is no longer the active cached entry for its key, later activity associated with that entry must not remove, expire, or otherwise modify a newer entry created for the same key.
+* Replacing a resource registered at an existing URI must make subsequent resource and anchor resolution reflect the replacement resource.
+* Resources and anchors discoverable only through a displaced resource must no longer be available after the resulting registry is crawled.
+* Resources and anchors introduced by the replacement must be discoverable normally.
+* A registry produced by replacing resources after an earlier crawl must be observationally equivalent to a registry built from the same current registrations without crawling the displaced resources first.
+* Existing registrations unrelated to the replaced resource must remain available.
+* A resource or anchor must remain available when it is still independently registered or still discoverable through another unaffected registered resource.
+* Replacement behavior must correctly account for internal identifiers, canonical identifiers, relative identifiers, nested subresources, and the existing empty-fragment URI normalization.
+* When the same URI occurs more than once in one update operation, the final registration for that URI must determine the resulting resource graph.
+* All existing resource-addition paths must remain consistent, including:
 
-The following behavior is required:
+  * `with_resource`
+  * `with_resources`
+  * `with_contents`
+  * resource insertion using `resource @ registry`
+* `combine()` must preserve its existing registry precedence rules, but the resources and anchors visible in the combined registry must correspond to the registrations that win according to those rules. Discoveries belonging only to displaced registrations must not leak into the result.
+* Registry immutability must be preserved. Updating or combining registries must not modify any input registry.
+* Resource addition and combination must remain lazy. They must not crawl resources or invoke retrieval merely to perform the update.
+* Repeatedly crawling an unchanged registry must remain idempotent and must not repeat discovery work.
+* Existing retrieval behavior, exception types, resolver behavior, and public APIs must remain compatible.
+* Do not require callers to manually remove resources or construct a new registry in order to replace an existing registration.
 
-* Invalidating an in-flight entry must allow a subsequent call with the same arguments to create and cache a new computation.
-* If a detached computation later raises an exception, its cleanup must not remove the replacement entry.
-* If a detached computation is later cancelled, its cleanup must not remove the replacement entry.
-* Successful completion of a detached computation must not install, reset, cancel, or otherwise alter expiration state belonging to the replacement entry.
-* Cleanup triggered by cancellation of callers waiting on a detached computation must not affect the replacement entry.
-* The same isolation guarantee must hold when an entry becomes detached through `cache_clear()` or normal cache eviction.
-* Multiple detached generations for the same key must remain isolated from the currently active generation and from one another.
-* The original detached callers must still observe the result, exception, or cancellation of their own computation.
-* Calls sharing the currently active entry must continue to share one underlying task.
-* A currently active entry must still be removed according to the existing behavior when its own computation fails or is cancelled.
-* A replacement entry must still expire normally according to its own TTL.
-* Existing cache hit, miss, invalidation, clearing, eviction, and TTL behavior must remain compatible for entries that have not been replaced.
-
-## Detached task lifecycle management
-
-Removing an in-flight entry from the cache lookup must not cause its underlying task to become unmanaged.
-
-A task created by the cache remains owned by that cache until it completes, fails, or is cancelled, even if the corresponding entry has already been invalidated, cleared, evicted, or replaced.
-
-The following behavior is required:
-
-* Detaching an entry must not by itself cancel its underlying task unless existing behavior already requires cancellation in that operation.
-* `cache_close(wait=False)` must cancel and await all unfinished tasks owned by the cache, including tasks belonging to detached entries.
-* `cache_close(wait=True)` must wait for all unfinished cache-owned tasks, including detached tasks, without cancelling them.
-* Active and detached tasks must not be registered more than once when they are shared by multiple callers or pass through multiple cache lifecycle operations.
-* A task must stop being tracked after it reaches a terminal state.
-* Tracking detached tasks must not unnecessarily retain completed tasks, cache entries, call arguments, results, exceptions, or bound instances.
-* Repeated calls to `cache_close()` must remain safe and idempotent.
-* Closing the cache must not allow callbacks from detached tasks to modify replacement entries.
-* If the project already exposes task-count or task-reporting behavior, that behavior must account for all unfinished cache-owned tasks, including detached tasks. No new public task-reporting API is required solely for this change.
-
-## Compatibility requirements
-
-* The fix must support both cached coroutine functions and cached async methods.
-* Existing behavior for callers currently awaiting a shared task must remain compatible.
-* Existing cache statistics must remain accurate.
-* Existing public APIs and return types should remain unchanged unless a public API change is necessary for correctness.
-* The implementation must not rely on timing-dependent sleeps or nondeterministic scheduling behavior.
-
-## Example scenario
-
-Consider a cached coroutine called repeatedly with the same arguments:
-
-1. The first call starts and remains in flight.
-2. Its cache entry is invalidated.
-3. A second call with the same arguments starts and becomes the active cached call.
-4. The first call later fails.
-
-After the first call fails, another call with the same arguments must continue to share or return the second call's cached computation. Cleanup from the first call must not remove the second entry.
-
-The first task must also remain owned by the cache after invalidation. If the cache is closed before that task finishes, `cache_close()` must manage it according to the requested `wait` mode rather than leaving it orphaned.
-
-The implementation should preserve existing asynchronous and cancellation semantics while ensuring that:
-
-1. cache-entry lifecycle actions apply only to the entry they belong to; and
-2. every unfinished task created by the cache remains under cache lifecycle management until termination.
-
+Resource lookup, anchor lookup, resolver lookup, iteration, and registry size must all reflect the same current resource graph after crawling.
 
 
 ```python
-import asyncio
-import gc
-import weakref
-from typing import Any, cast
+from __future__ import annotations
+
+from collections.abc import Iterable
 
 import pytest
 
-from async_lru import alru_cache
+from referencing import Anchor, Registry, Resource, Specification, exceptions
+from referencing.jsonschema import DRAFT202012
 
 
-class ControlledCalls:
-    """Create one externally controlled Future per underlying invocation."""
+def _id_of(contents: object) -> str | None:
+    if not isinstance(contents, dict):
+        return None
 
-    def __init__(self) -> None:
-        self.started: asyncio.Queue[
-            tuple[
-                str,
-                asyncio.Future[str],
-                asyncio.Task[str],
-            ]
-        ] = asyncio.Queue()
+    identifier = contents.get("id")
+    return identifier if isinstance(identifier, str) else None
 
-    async def run(self, key: str) -> str:
-        loop = asyncio.get_running_loop()
-        gate: asyncio.Future[str] = loop.create_future()
 
-        current = asyncio.current_task()
-        assert current is not None
+def _subresources_of(contents: object) -> Iterable[object]:
+    if not isinstance(contents, dict):
+        return ()
 
-        self.started.put_nowait(
-            (
-                key,
-                gate,
-                cast(asyncio.Task[str], current),
-            )
+    children = contents.get("children", ())
+    return children if isinstance(children, list) else ()
+
+
+def _anchors_in(
+    specification: Specification[object],
+    contents: object,
+) -> Iterable[Anchor[object]]:
+    if not isinstance(contents, dict):
+        return ()
+
+    anchors = contents.get("anchors", {})
+    if not isinstance(anchors, dict):
+        return ()
+
+    return (
+        Anchor(
+            name=name,
+            resource=specification.create_resource(value),
         )
-        return await gate
-
-    async def next(
-        self,
-        expected_key: str,
-    ) -> tuple[asyncio.Future[str], asyncio.Task[str]]:
-        key, gate, task = await self.started.get()
-        assert key == expected_key
-        return gate, task
+        for name, value in anchors.items()
+    )
 
 
-async def drain_callbacks() -> None:
-    """Allow task completion and cache callbacks to run."""
+GRAPH = Specification(
+    name="replacement-graph",
+    id_of=_id_of,
+    subresources_of=_subresources_of,
+    anchors_in=_anchors_in,
+    maybe_in_subresource=lambda segments, resolver, subresource: resolver,
+)
 
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
+
+def graph_resource(contents: object) -> Resource[object]:
+    return GRAPH.create_resource(contents)
 
 
-async def cancel_and_drain(
-    *tasks: asyncio.Task[Any],
+def assert_no_resource(
+    registry: Registry[object],
+    uri: str,
 ) -> None:
-    for task in tasks:
-        if not task.done():
-            task.cancel()
-
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    await drain_callbacks()
+    with pytest.raises(exceptions.NoSuchResource):
+        registry.contents(uri)
 
 
-async def test_cache_close_cancels_detached_and_active_tasks() -> None:
-    calls = ControlledCalls()
-
-    @alru_cache()
-    async def cached(key: str) -> str:
-        return await calls.run(key)
-
-    old_waiter = asyncio.create_task(cached("key"))
-    _, old_task = await calls.next("key")
-
-    assert cached.cache_invalidate("key")
-
-    replacement_waiter = asyncio.create_task(cached("key"))
-    _, replacement_task = await calls.next("key")
-
-    try:
-        await cached.cache_close(wait=False)
-        await drain_callbacks()
-
-        # cache_close() owns both tasks, even though only the replacement
-        # remains reachable through the cache lookup.
-        assert old_task.cancelled()
-        assert replacement_task.cancelled()
-
-        with pytest.raises(asyncio.CancelledError):
-            await old_waiter
-
-        with pytest.raises(asyncio.CancelledError):
-            await replacement_waiter
-
-        assert cached.cache_parameters()["tasks"] == 0
-        assert cached.cache_parameters()["closed"] is True
-
-        # Closing an already closed cache remains safe.
-        await cached.cache_close(wait=False)
-        await cached.cache_close(wait=True)
-    finally:
-        await cancel_and_drain(old_waiter, replacement_waiter)
+def assert_no_anchor(
+    registry: Registry[object],
+    uri: str,
+    name: str,
+) -> None:
+    with pytest.raises(
+        (exceptions.NoSuchAnchor, exceptions.NoSuchResource),
+    ):
+        registry.anchor(uri, name)
 
 
-async def test_cache_close_waits_for_detached_tasks_without_cancelling() -> None:
-    calls = ControlledCalls()
+# ---------------------------------------------------------------------------
+# PUBLIC TEST
+# ---------------------------------------------------------------------------
 
-    @alru_cache()
-    async def cached(key: str) -> str:
-        return await calls.run(key)
 
-    old_waiter = asyncio.create_task(cached("key"))
-    old_gate, old_task = await calls.next("key")
+def test_replacing_crawled_resource_drops_old_anchor() -> None:
+    uri = "https://example.test/root"
 
-    assert cached.cache_invalidate("key")
+    old = graph_resource(
+        {
+            "anchors": {
+                "old": {"version": "old"},
+            },
+        },
+    )
+    new = graph_resource(
+        {
+            "anchors": {
+                "new": {"version": "new"},
+            },
+        },
+    )
 
-    replacement_waiter = asyncio.create_task(cached("key"))
-    replacement_gate, replacement_task = await calls.next("key")
+    original = Registry().with_resource(uri, old).crawl()
+    replaced = original.with_resource(uri, new).crawl()
 
-    close_task = asyncio.create_task(cached.cache_close(wait=True))
+    # Registry snapshots remain immutable.
+    assert original.anchor(uri, "old").value.resource.contents == {
+        "version": "old",
+    }
 
-    try:
-        await drain_callbacks()
+    assert replaced.contents(uri) == new.contents
+    assert_no_anchor(replaced, uri, "old")
 
-        assert not close_task.done()
-        assert not old_task.cancelled()
-        assert not replacement_task.cancelled()
-        assert not old_gate.cancelled()
-        assert not replacement_gate.cancelled()
+    assert replaced.anchor(uri, "new").value.resource.contents == {
+        "version": "new",
+    }
 
-        # Completing only the active replacement must not allow close()
-        # to return while the detached generation is still running.
-        replacement_gate.set_result("replacement")
-        assert await replacement_waiter == "replacement"
 
-        await drain_callbacks()
+# ---------------------------------------------------------------------------
+# HIDDEN: nested resource graph retraction
+# ---------------------------------------------------------------------------
 
-        assert not close_task.done()
-        assert not old_task.done()
-        assert cached.cache_parameters()["tasks"] == 1
 
-        old_gate.set_result("old")
-        assert await old_waiter == "old"
+def test_replacement_retracts_nested_relative_resources_and_anchors() -> None:
+    root_uri = "https://example.test/schemas/root"
+    child_uri = "https://example.test/schemas/child"
+    grandchild_uri = (
+        "https://example.test/schemas/nested/grandchild"
+    )
 
-        await close_task
+    old = graph_resource(
+        {
+            "children": [
+                {
+                    "id": "child",
+                    "anchors": {
+                        "child-anchor": {"from": "child"},
+                    },
+                    "children": [
+                        {
+                            "id": "nested/grandchild",
+                            "anchors": {
+                                "deep": {"from": "grandchild"},
+                            },
+                        },
+                    ],
+                },
+            ],
+        },
+    )
+    new = graph_resource(
+        {
+            "anchors": {
+                "current": {"from": "new"},
+            },
+        },
+    )
 
-        assert cached.cache_parameters()["tasks"] == 0
-        assert cached.cache_parameters()["closed"] is True
-    finally:
-        await cancel_and_drain(
-            old_waiter,
-            replacement_waiter,
-            close_task,
+    replaced = (
+        Registry()
+        .with_resource(root_uri, old)
+        .crawl()
+        .with_resource(root_uri, new)
+        .crawl()
+    )
+
+    assert_no_resource(replaced, child_uri)
+    assert_no_resource(replaced, grandchild_uri)
+    assert_no_anchor(replaced, child_uri, "child-anchor")
+    assert_no_anchor(replaced, grandchild_uri, "deep")
+
+    assert replaced.anchor(
+        root_uri,
+        "current",
+    ).value.resource.contents == {
+        "from": "new",
+    }
+
+
+# ---------------------------------------------------------------------------
+# HIDDEN: registration URI versus canonical resource identifier
+# ---------------------------------------------------------------------------
+
+
+def test_replacement_retracts_old_canonical_identifier() -> None:
+    registered_uri = "https://retrieval.test/slot"
+    old_canonical = "https://schemas.test/old"
+    new_canonical = "https://schemas.test/new"
+
+    old = graph_resource(
+        {
+            "id": old_canonical,
+            "anchors": {
+                "version": {"value": "old"},
+            },
+        },
+    )
+    new = graph_resource(
+        {
+            "id": new_canonical,
+            "anchors": {
+                "version": {"value": "new"},
+            },
+        },
+    )
+
+    replaced = (
+        Registry()
+        .with_resource(registered_uri, old)
+        .crawl()
+        .with_resource(registered_uri, new)
+        .crawl()
+    )
+
+    assert replaced.contents(registered_uri) == new.contents
+    assert replaced.contents(new_canonical) == new.contents
+
+    assert_no_resource(replaced, old_canonical)
+    assert_no_anchor(replaced, old_canonical, "version")
+
+    assert replaced.anchor(
+        new_canonical,
+        "version",
+    ).value.resource.contents == {
+        "value": "new",
+    }
+
+
+# ---------------------------------------------------------------------------
+# HIDDEN: directly registered resources must survive graph cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_explicit_resource_at_old_child_uri_is_preserved() -> None:
+    root_uri = "https://example.test/root"
+    shared_uri = "https://example.test/shared"
+
+    old_root = graph_resource(
+        {
+            "children": [
+                {
+                    "id": shared_uri,
+                    "anchors": {
+                        "derived": {"source": "old-root"},
+                    },
+                },
+            ],
+        },
+    )
+    explicit = graph_resource(
+        {
+            "id": shared_uri,
+            "anchors": {
+                "explicit": {"source": "explicit"},
+            },
+        },
+    )
+    replacement_root = graph_resource({})
+
+    registry = Registry().with_resource(root_uri, old_root).crawl()
+
+    # This registration replaces the discovered child as the current
+    # resource at shared_uri.
+    registry = registry.with_resource(shared_uri, explicit).crawl()
+
+    replaced = registry.with_resource(
+        root_uri,
+        replacement_root,
+    ).crawl()
+
+    assert replaced.contents(shared_uri) == explicit.contents
+
+    assert replaced.anchor(
+        shared_uri,
+        "explicit",
+    ).value.resource.contents == {
+        "source": "explicit",
+    }
+
+    assert_no_anchor(replaced, shared_uri, "derived")
+
+
+# ---------------------------------------------------------------------------
+# HIDDEN: an independently reachable discovery must survive
+# Preservation test: current implementation may already pass.
+# ---------------------------------------------------------------------------
+
+
+def test_discovery_reachable_from_another_root_is_preserved() -> None:
+    first_uri = "https://example.test/first"
+    second_uri = "https://example.test/second"
+    shared_uri = "https://example.test/shared"
+
+    shared = {
+        "id": shared_uri,
+        "anchors": {
+            "kept": {"source": "shared"},
+        },
+    }
+
+    first = graph_resource({"children": [shared]})
+    second = graph_resource({"children": [shared]})
+    replacement = graph_resource({})
+
+    registry = (
+        Registry()
+        .with_resources(
+            [
+                (first_uri, first),
+                (second_uri, second),
+            ],
+        )
+        .crawl()
+    )
+
+    replaced = registry.with_resource(
+        first_uri,
+        replacement,
+    ).crawl()
+
+    assert replaced.contents(shared_uri) == shared
+    assert replaced.anchor(
+        shared_uri,
+        "kept",
+    ).value.resource.contents == {
+        "source": "shared",
+    }
+
+
+# ---------------------------------------------------------------------------
+# HIDDEN: one resource registered through multiple aliases
+# Preservation test: rejects URI-wide over-deletion.
+# ---------------------------------------------------------------------------
+
+
+def test_replacing_one_alias_preserves_other_alias_reachability() -> None:
+    alias_a = "https://retrieval.test/a"
+    alias_b = "https://retrieval.test/b"
+    canonical = "https://schemas.test/shared"
+
+    shared = graph_resource(
+        {
+            "id": canonical,
+            "anchors": {
+                "kept": {"source": "shared"},
+            },
+        },
+    )
+
+    registry = (
+        Registry()
+        .with_resources(
+            [
+                (alias_a, shared),
+                (alias_b, shared),
+            ],
+        )
+        .crawl()
+    )
+
+    replaced = registry.with_resource(
+        alias_a,
+        graph_resource({}),
+    ).crawl()
+
+    assert replaced.contents(alias_b) == shared.contents
+    assert replaced.contents(canonical) == shared.contents
+
+    assert replaced.anchor(
+        canonical,
+        "kept",
+    ).value.resource.contents == {
+        "source": "shared",
+    }
+
+
+# ---------------------------------------------------------------------------
+# HIDDEN: duplicate normalized URIs in one batch
+# ---------------------------------------------------------------------------
+
+
+def test_batch_replacement_uses_only_final_resource_graph() -> None:
+    uri = "https://example.test/root"
+    old_child = "https://example.test/old-child"
+    middle_child = "https://example.test/middle-child"
+    final_child = "https://example.test/final-child"
+
+    def version(
+        name: str,
+        child: str,
+    ) -> Resource[object]:
+        return graph_resource(
+            {
+                "anchors": {
+                    name: {"version": name},
+                },
+                "children": [
+                    {
+                        "id": child,
+                        "value": name,
+                    },
+                ],
+            },
         )
 
+    old = version("old", old_child)
+    middle = version("middle", middle_child)
+    final = version("final", final_child)
 
-async def test_task_reporting_includes_multiple_detached_generations() -> None:
-    calls = ControlledCalls()
+    registry = Registry().with_resource(uri, old).crawl()
 
-    @alru_cache()
-    async def cached(key: str) -> str:
-        return await calls.run(key)
+    replaced = registry.with_resources(
+        [
+            (uri + "#", middle),
+            (uri, final),
+        ],
+    ).crawl()
 
-    generation_a = asyncio.create_task(cached("key"))
-    gate_a, _ = await calls.next("key")
+    assert replaced.contents(uri) == final.contents
+    assert replaced.contents(final_child) == {
+        "id": final_child,
+        "value": "final",
+    }
 
-    assert cached.cache_invalidate("key")
+    assert_no_resource(replaced, old_child)
+    assert_no_resource(replaced, middle_child)
+    assert_no_anchor(replaced, uri, "old")
+    assert_no_anchor(replaced, uri, "middle")
 
-    generation_b = asyncio.create_task(cached("key"))
-    gate_b, _ = await calls.next("key")
+    assert replaced.anchor(
+        uri,
+        "final",
+    ).value.resource.contents == {
+        "version": "final",
+    }
 
-    # B becomes detached through cache clearing rather than invalidation.
-    cached.cache_clear()
 
-    generation_c = asyncio.create_task(cached("key"))
-    _, _ = await calls.next("key")
+# ---------------------------------------------------------------------------
+# HIDDEN: combine with an uncrawled winning registration
+# ---------------------------------------------------------------------------
 
-    try:
-        # A and B are detached; C is active.
-        assert cached.cache_parameters()["tasks"] == 3
 
-        gate_a.set_result("generation a")
-        assert await generation_a == "generation a"
+def test_combine_uncrawled_winner_retracts_loser_graph() -> None:
+    uri = "https://example.test/root"
+    old_child = "https://example.test/old-child"
+    new_child = "https://example.test/new-child"
 
-        await drain_callbacks()
-        assert cached.cache_parameters()["tasks"] == 2
+    old = graph_resource(
+        {
+            "anchors": {
+                "old": {"version": "old"},
+            },
+            "children": [
+                {
+                    "id": old_child,
+                    "value": "old",
+                },
+            ],
+        },
+    )
+    new = graph_resource(
+        {
+            "anchors": {
+                "new": {"version": "new"},
+            },
+            "children": [
+                {
+                    "id": new_child,
+                    "value": "new",
+                },
+            ],
+        },
+    )
 
-        gate_b.set_exception(RuntimeError("generation b failed"))
+    crawled_loser = Registry().with_resource(uri, old).crawl()
+    uncrawled_winner = Registry().with_resource(uri, new)
 
-        with pytest.raises(
-            RuntimeError,
-            match="generation b failed",
-        ):
-            await generation_b
+    combined = crawled_loser.combine(
+        uncrawled_winner,
+    ).crawl()
 
-        await drain_callbacks()
+    assert combined.contents(uri) == new.contents
+    assert combined.contents(new_child) == {
+        "id": new_child,
+        "value": "new",
+    }
 
-        # The detached B failure must not remove or untrack C.
-        assert cached.cache_contains("key")
-        assert cached.cache_parameters()["tasks"] == 1
+    assert_no_resource(combined, old_child)
+    assert_no_anchor(combined, uri, "old")
 
-        generation_c.cancel()
+    assert combined.anchor(
+        uri,
+        "new",
+    ).value.resource.contents == {
+        "version": "new",
+    }
 
-        with pytest.raises(asyncio.CancelledError):
-            await generation_c
 
-        await drain_callbacks()
-        assert cached.cache_parameters()["tasks"] == 0
-    finally:
-        await cancel_and_drain(
-            generation_a,
-            generation_b,
-            generation_c,
+# ---------------------------------------------------------------------------
+# HIDDEN: both combine inputs have already been crawled
+# ---------------------------------------------------------------------------
+
+
+def test_combine_crawled_winner_drops_loser_only_anchors() -> None:
+    uri = "https://example.test/root"
+
+    old = graph_resource(
+        {
+            "anchors": {
+                "old": {"version": "old"},
+            },
+        },
+    )
+    new = graph_resource(
+        {
+            "anchors": {
+                "new": {"version": "new"},
+            },
+        },
+    )
+
+    loser = Registry().with_resource(uri, old).crawl()
+    winner = Registry().with_resource(uri, new).crawl()
+
+    combined = loser.combine(winner)
+
+    assert combined.contents(uri) == new.contents
+    assert_no_anchor(combined, uri, "old")
+
+    assert combined.anchor(
+        uri,
+        "new",
+    ).value.resource.contents == {
+        "version": "new",
+    }
+
+
+# ---------------------------------------------------------------------------
+# HIDDEN: Resource.__matmul__ uses a separate insertion path
+# ---------------------------------------------------------------------------
+
+
+def test_matmul_replacement_retracts_previous_graph() -> None:
+    uri = "https://example.test/root"
+    old_child = "https://example.test/old-child"
+
+    old = graph_resource(
+        {
+            "id": uri,
+            "anchors": {
+                "old": {"version": "old"},
+            },
+            "children": [
+                {
+                    "id": old_child,
+                    "value": "old",
+                },
+            ],
+        },
+    )
+    new = graph_resource(
+        {
+            "id": uri,
+            "anchors": {
+                "new": {"version": "new"},
+            },
+        },
+    )
+
+    original = (old @ Registry()).crawl()
+    replaced = (new @ original).crawl()
+
+    assert replaced.contents(uri) == new.contents
+    assert_no_resource(replaced, old_child)
+    assert_no_anchor(replaced, uri, "old")
+
+    assert replaced.anchor(
+        uri,
+        "new",
+    ).value.resource.contents == {
+        "version": "new",
+    }
+
+
+# ---------------------------------------------------------------------------
+# HIDDEN: use the real JSON Schema specification and Resolver API
+# Also exercises with_contents().
+# ---------------------------------------------------------------------------
+
+
+def test_json_schema_resolver_cannot_see_replaced_subschema() -> None:
+    registered_uri = "https://retrieval.test/root"
+    old_child_uri = "https://schemas.test/child"
+    new_child_uri = "https://schemas.test/replacement"
+
+    old = {
+        "$id": "https://schemas.test/root",
+        "$defs": {
+            "child": {
+                "$id": old_child_uri,
+                "$anchor": "old",
+                "const": "old",
+            },
+        },
+    }
+    new = {
+        "$id": "https://schemas.test/new-root",
+        "$defs": {
+            "child": {
+                "$id": new_child_uri,
+                "$anchor": "new",
+                "const": "new",
+            },
+        },
+    }
+
+    replaced = (
+        Registry()
+        .with_contents(
+            [(registered_uri, old)],
+            default_specification=DRAFT202012,
         )
-
-
-async def test_evicted_task_remains_owned_by_cache_close() -> None:
-    calls = ControlledCalls()
-
-    @alru_cache(maxsize=1)
-    async def cached(key: str) -> str:
-        return await calls.run(key)
-
-    evicted_waiter = asyncio.create_task(cached("x"))
-    _, evicted_task = await calls.next("x")
-
-    active_waiter = asyncio.create_task(cached("y"))
-    _, active_task = await calls.next("y")
-
-    try:
-        assert not cached.cache_contains("x")
-        assert cached.cache_contains("y")
-
-        # The evicted X task and active Y task are both still unfinished.
-        assert cached.cache_parameters()["tasks"] == 2
-
-        await cached.cache_close(wait=False)
-        await drain_callbacks()
-
-        assert evicted_task.cancelled()
-        assert active_task.cancelled()
-
-        with pytest.raises(asyncio.CancelledError):
-            await evicted_waiter
-
-        with pytest.raises(asyncio.CancelledError):
-            await active_waiter
-
-        assert cached.cache_parameters()["tasks"] == 0
-    finally:
-        await cancel_and_drain(evicted_waiter, active_waiter)
-
-
-async def test_cache_clear_does_not_orphan_inflight_tasks() -> None:
-    calls = ControlledCalls()
-
-    @alru_cache(maxsize=None)
-    async def cached(key: str) -> str:
-        return await calls.run(key)
-
-    first_waiter = asyncio.create_task(cached("first"))
-    _, first_task = await calls.next("first")
-
-    second_waiter = asyncio.create_task(cached("second"))
-    _, second_task = await calls.next("second")
-
-    cached.cache_clear()
-
-    try:
-        assert not cached.cache_contains("first")
-        assert not cached.cache_contains("second")
-        assert cached.cache_parameters()["tasks"] == 2
-
-        await cached.cache_close(wait=False)
-        await drain_callbacks()
-
-        assert first_task.cancelled()
-        assert second_task.cancelled()
-
-        with pytest.raises(asyncio.CancelledError):
-            await first_waiter
-
-        with pytest.raises(asyncio.CancelledError):
-            await second_waiter
-
-        assert cached.cache_parameters()["tasks"] == 0
-    finally:
-        await cancel_and_drain(first_waiter, second_waiter)
-
-
-async def test_shared_callers_do_not_duplicate_task_tracking() -> None:
-    calls = ControlledCalls()
-
-    @alru_cache()
-    async def cached(key: str) -> str:
-        return await calls.run(key)
-
-    first_waiter = asyncio.create_task(cached("key"))
-    _, original_task = await calls.next("key")
-
-    second_waiter = asyncio.create_task(cached("key"))
-    await drain_callbacks()
-
-    # The second caller shares the existing underlying task.
-    assert calls.started.empty()
-    assert cached.cache_parameters()["tasks"] == 1
-
-    assert cached.cache_invalidate("key")
-
-    # Detaching the task must not duplicate or remove its ownership record.
-    assert cached.cache_parameters()["tasks"] == 1
-
-    replacement_waiter = asyncio.create_task(cached("key"))
-    _, replacement_task = await calls.next("key")
-
-    try:
-        assert original_task is not replacement_task
-        assert cached.cache_parameters()["tasks"] == 2
-
-        # Detach the replacement as well. There are still exactly two
-        # underlying tasks, despite three logical callers.
-        assert cached.cache_invalidate("key")
-        assert cached.cache_parameters()["tasks"] == 2
-
-        await cached.cache_close(wait=False)
-        await drain_callbacks()
-
-        assert original_task.cancelled()
-        assert replacement_task.cancelled()
-        assert cached.cache_parameters()["tasks"] == 0
-
-        for waiter in (
-            first_waiter,
-            second_waiter,
-            replacement_waiter,
-        ):
-            with pytest.raises(asyncio.CancelledError):
-                await waiter
-    finally:
-        await cancel_and_drain(
-            first_waiter,
-            second_waiter,
-            replacement_waiter,
+        .crawl()
+        .with_contents(
+            [(registered_uri, new)],
+            default_specification=DRAFT202012,
         )
+        .crawl()
+    )
+
+    resolver = replaced.resolver()
+
+    with pytest.raises(exceptions.Unresolvable):
+        resolver.lookup(old_child_uri + "#old")
+
+    assert resolver.lookup(
+        new_child_uri + "#new",
+    ).contents == {
+        "$id": new_child_uri,
+        "$anchor": "new",
+        "const": "new",
+    }
 
 
-async def test_completed_detached_tasks_are_not_retained() -> None:
-    class Payload:
-        pass
-
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    @alru_cache()
-    async def cached(value: Payload) -> Payload:
-        started.set()
-        await release.wait()
-        return value
-
-    payload = Payload()
-    payload_ref = weakref.ref(payload)
-
-    waiter = asyncio.create_task(cached(payload))
-    await started.wait()
-
-    assert cached.cache_invalidate(payload)
-    assert cached.cache_parameters()["tasks"] == 1
-
-    release.set()
-    assert await waiter is payload
-
-    await drain_callbacks()
-
-    assert cached.cache_parameters()["tasks"] == 0
-
-    # The completed Task's result refers to payload. If the cache keeps the
-    # terminal Task in its ownership collection, payload remains alive.
-    del waiter
-    del payload
-
-    for _ in range(3):
-        gc.collect()
-        await asyncio.sleep(0)
-
-    assert payload_ref() is None
-
-    await cached.cache_close(wait=True)
-    await cached.cache_close(wait=False)
-
-    assert cached.cache_parameters()["tasks"] == 0
-    assert cached.cache_parameters()["closed"] is True
+# ---------------------------------------------------------------------------
+# HIDDEN: prevent an eager full rebuild and repeated crawl work
+# ---------------------------------------------------------------------------
 
 
-async def test_async_method_close_manages_detached_generations() -> None:
-    calls = ControlledCalls()
+def test_replacement_remains_lazy_and_crawl_is_idempotent() -> None:
+    calls = {
+        "anchors": 0,
+        "children": 0,
+    }
 
-    class Service:
-        @alru_cache()
-        async def load(self, key: str) -> str:
-            return await calls.run(key)
+    def children(contents: object) -> Iterable[object]:
+        calls["children"] += 1
+        return _subresources_of(contents)
 
-    service = Service()
+    def anchors(
+        specification: Specification[object],
+        contents: object,
+    ) -> Iterable[Anchor[object]]:
+        calls["anchors"] += 1
+        return _anchors_in(specification, contents)
 
-    old_waiter = asyncio.create_task(service.load("key"))
-    _, old_task = await calls.next("key")
+    counted = Specification(
+        name="counted",
+        id_of=_id_of,
+        subresources_of=children,
+        anchors_in=anchors,
+        maybe_in_subresource=(
+            lambda segments, resolver, subresource: resolver
+        ),
+    )
 
-    assert service.load.cache_invalidate("key")
+    uri = "https://example.test/root"
 
-    replacement_waiter = asyncio.create_task(service.load("key"))
-    _, replacement_task = await calls.next("key")
+    old = counted.create_resource(
+        {
+            "anchors": {
+                "old": {},
+            },
+        },
+    )
+    new = counted.create_resource(
+        {
+            "anchors": {
+                "new": {},
+            },
+        },
+    )
 
-    try:
-        assert service.load.cache_parameters()["tasks"] == 2
+    original = Registry().with_resource(uri, old).crawl()
 
-        await service.load.cache_close(wait=False)
-        await drain_callbacks()
+    calls["anchors"] = 0
+    calls["children"] = 0
 
-        assert old_task.cancelled()
-        assert replacement_task.cancelled()
+    pending = original.with_resource(uri, new)
 
-        with pytest.raises(asyncio.CancelledError):
-            await old_waiter
+    # Replacement itself must remain lazy.
+    assert calls == {
+        "anchors": 0,
+        "children": 0,
+    }
 
-        with pytest.raises(asyncio.CancelledError):
-            await replacement_waiter
+    once = pending.crawl()
+    after_first_crawl = dict(calls)
 
-        assert service.load.cache_parameters()["tasks"] == 0
-    finally:
-        await cancel_and_drain(old_waiter, replacement_waiter)
+    assert after_first_crawl["anchors"] > 0
+    assert after_first_crawl["children"] > 0
+
+    twice = once.crawl()
+
+    # An already crawled registry must not be traversed again.
+    assert calls == after_first_crawl
+    assert once == twice
+
+    assert_no_anchor(twice, uri, "old")
+    assert twice.anchor(
+        uri,
+        "new",
+    ).value.resource.contents == {}
 ```
