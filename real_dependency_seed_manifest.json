@@ -1,0 +1,63 @@
+{
+  "development_status_counts": {
+    "alpha": 25,
+    "beta": 63,
+    "inactive": 2,
+    "mature": 15,
+    "planning": 1,
+    "pre-alpha": 4,
+    "stable": 274,
+    "unknown": 121
+  },
+  "edge_type_counts": {
+    "0": 974,
+    "1": 71,
+    "2": 11,
+    "3": 1033,
+    "4": 2
+  },
+  "excluded_harness_distributions": [
+    "artifact-tool-v2",
+    "caas-jupyter-tools"
+  ],
+  "in_degree": {
+    "max": 159,
+    "median": 1.0,
+    "p90": 8.0,
+    "p99": 52.87999999999994
+  },
+  "installed_size_mb": {
+    "max": 741.666987,
+    "median": 0.540617,
+    "p90": 22.26511260000001,
+    "p99": 271.26889735999896
+  },
+  "license_code_counts": {
+    "apache": 65,
+    "bsd": 82,
+    "gpl": 9,
+    "isc": 7,
+    "mit": 191,
+    "mpl": 45,
+    "psf": 5,
+    "public-domain": 2,
+    "unknown": 99
+  },
+  "notes": [
+    "Topology and node covariates come from an observed Python environment, not a random graph generator.",
+    "Only package metadata and dependency declarations are retained; package source files are not redistributed.",
+    "The benchmark generator samples dependency bundles from this pinned snapshot and creates deterministic benchmark supervision."
+  ],
+  "out_degree": {
+    "max": 31,
+    "median": 2.0,
+    "p90": 10.600000000000023,
+    "p99": 27.0
+  },
+  "package_count": 505,
+  "python_runtime": "3.11",
+  "seed_sha256": "9bbae6afd51e7680e9d465853fb261a158fc05b213e33bd0c592953e3f1ac506",
+  "snapshot_date": "2026-09-03",
+  "snapshot_kind": "installed Python distribution metadata",
+  "typed_dependency_edge_count": 2091
+}
