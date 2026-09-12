@@ -1,0 +1,7 @@
+{
+  "artifact_limit_bytes": 65536,
+  "customer_disjoint_eval": true,
+  "metric": "macro_binary_ndcg_at_10",
+  "normalization": "clip((raw-popularity)/(1-popularity),0,1)",
+  "popularity_ndcg_at_10": 0.07597407381937642
+}

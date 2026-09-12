@@ -1,0 +1,1 @@
+{"rubric_id":"main_reward","description":"Normalized macro NDCG@10 above a global-popularity floor, gated by a valid deterministic <=64 KiB self-contained inference artifact.","weight":1.0}
