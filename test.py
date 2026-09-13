@@ -36,45 +36,28 @@ The score is based on how highly hidden next-basket items appear in each held-ou
 
 Keep the submission deterministic. Reordering input rows must only reorder the corresponding outputs.
 
+predict
+#!/usr/bin/env python3
+"""Author-only popularity smoke baseline; not an oracle/reference/optimum."""
+from __future__ import annotations
+import csv, pathlib, sys
+HERE=pathlib.Path(__file__).resolve().parent
+POPULAR=HERE/"popular_items.txt"
 
-test.sh
-# Compact next-basket recommendation
-
-`/app/train.csv` contains real purchase histories derived from UCI Online Retail II. Each row is one training customer: an ordered basket history plus that customer's next basket.
-
-Build `/output/predict.py`.
-
-It will be called as:
-
-```bash
-python /output/predict.py <in.csv> <out.csv>
-```
-
-`<in.csv>` has these columns:
-
-```text
-query_id,history,gaps_days
-```
-
-`history` is a sequence of baskets. Baskets are separated by `|`; item IDs inside a basket are separated by spaces. The last basket in `history` is the most recent observed basket. `gaps_days` contains one non-negative day gap per history basket, in the same order.
-
-Write `<out.csv>` with exactly one column named `prediction`. Each row must contain exactly **10 distinct item IDs**, separated by single spaces, best recommendation first. Output rows must correspond to input rows in the same order.
-
-The complete `/output` artifact is limited to **64 KiB (65,536 bytes)**. This includes `predict.py` and every model, table, index, or other file under `/output`. Symlinks and other special files are not allowed.
-
-The held-out customers are disjoint from the customers in `/app/train.csv`. Their visible histories are supplied only through `<in.csv>` at evaluation time. The predictor cannot access `/app/train.csv` during final evaluation, so any cross-customer statistics or learned model state needed at inference time must fit inside `/output`.
-
-Training columns are:
-
-```text
-query_id,history,gaps_days,target_items
-```
-
-`target_items` is the next basket for that training history. IDs are opaque remapped identifiers; do not infer meaning from their numeric values.
-
-The score is based on how highly hidden next-basket items appear in each held-out customer's top-10 ranking. A train-derived global-popularity recommender is the score floor. The useful part of the task is deciding which global patterns are worth encoding under the artifact-size limit while exploiting each new customer's history at inference time.
-
-Keep the submission deterministic. Reordering input rows must only reorder the corresponding outputs.
+def main():
+    if len(sys.argv)!=3: raise SystemExit("usage: predict.py <in.csv> <out.csv>")
+    items=POPULAR.read_text(encoding="utf-8").strip().split()
+    if len(items)<10: raise SystemExit("popular_items.txt missing/invalid")
+    pred=" ".join(items[:10])
+    with open(sys.argv[1],newline="",encoding="utf-8") as f:
+        r=csv.DictReader(f)
+        if r.fieldnames != ["query_id","history","gaps_days"]: raise SystemExit("bad input schema")
+        rows=list(r)
+    with open(sys.argv[2],"w",newline="",encoding="utf-8") as f:
+        w=csv.writer(f); w.writerow(["prediction"])
+        for _ in rows:w.writerow([pred])
+    return 0
+if __name__=="__main__": raise SystemExit(main())
 
 test smoke
 from pathlib import Path
@@ -125,6 +108,37 @@ except Exception:
 peak = float(metrics.get("peak_child_memory_mb", 0.0) or 0.0)
 (LOG / "peak_memory_mb.txt").write_text(f"{peak:.3f}\n", encoding="utf-8")
 
+test main
+from __future__ import annotations
+import csv,json,math,pathlib,tempfile,resource
+from verifier_utils import artifact_size_and_validate,load_catalog,ndcg_at_10,parse_predictions,run_predict,write_input
+TEST_DIR=pathlib.Path(__file__).resolve().parent; LOG_DIR=pathlib.Path('/logs/verifier')
+
+def _load_cases():
+    out=[]
+    with (TEST_DIR/'test.csv').open(newline='',encoding='utf-8') as f:
+        r=csv.DictReader(f); assert r.fieldnames==['query_id','history','gaps_days','target_items'],f'bad test schema: {r.fieldnames}'
+        for row in r:
+            t={x for x in row['target_items'].split() if x}
+            if t: out.append((row['query_id'],row['history'],row['gaps_days'],t))
+    assert out,'empty test.csv'; return out
+
+def _score(preds,cases):
+    vals=[ndcg_at_10(p,c[3]) for p,c in zip(preds,cases)]; hits=[1.0 if any(x in c[3] for x in p) else 0.0 for p,c in zip(preds,cases)]; return sum(vals)/len(vals),sum(hits)/len(hits)
+
+def test_reward():
+    LOG_DIR.mkdir(parents=True,exist_ok=True); artifact_bytes=artifact_size_and_validate(); catalog=load_catalog(); cases=_load_cases(); config=json.loads((TEST_DIR/'scoring_config.json').read_text()); floor=float(config['popularity_ndcg_at_10']); reference=float(config['reference_ndcg_at_10']); reference_reward=float(config['reference_reward'])
+    assert 0.0 <= floor < reference <= 1.0, 'invalid reward anchors'; assert 0.0 < reference_reward < 1.0, 'invalid reference reward'
+    rows=[(c[0],c[1],c[2]) for c in cases]
+    with tempfile.TemporaryDirectory(prefix='oe_main_') as td:
+        td=pathlib.Path(td); p_in=td/'in.csv'; p_out=td/'out.csv'; p_rev=td/'rev.csv'; p_rev_out=td/'rev_out.csv'
+        write_input(p_in,rows); run_predict(p_in,p_out,timeout=60); preds=parse_predictions(p_out,len(cases),catalog)
+        write_input(p_rev,list(reversed(rows))); run_predict(p_rev,p_rev_out,timeout=60); rp=parse_predictions(p_rev_out,len(cases),catalog); assert rp==list(reversed(preds)),'predictions depend on input row position'
+    raw,hit=_score(preds,cases); z=max(0.0,(raw-floor)/max(1e-12,reference-floor)); reward=1.0-(1.0-reference_reward)**z; reward=max(0.0,min(1.0,reward)); assert math.isfinite(reward)
+    peak=resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss/1024.0
+    metrics={'reward':reward,'ndcg_at_10':raw,'popularity_ndcg_at_10':floor,'reference_ndcg_at_10':reference,'reference_reward':reference_reward,'reward_gap_units':z,'hit_rate_at_10':hit,'evaluated_customers':len(cases),'catalog_size':len(catalog),'artifact_bytes':artifact_bytes,'artifact_limit_bytes':65536,'customer_disjoint_eval':True,'peak_child_memory_mb':peak}
+    (LOG_DIR/'reward.txt').write_text(f'{reward:.12f}\n'); (LOG_DIR/'metrics.json').write_text(json.dumps(metrics,indent=2,sort_keys=True)+'\n')
+
 verifier
 from __future__ import annotations
 import contextlib,csv,math,os,pathlib,shutil,subprocess,tempfile
@@ -168,7 +182,7 @@ def _chown_tree(root,uid,gid):
         try:os.chown(p,uid,gid)
         except OSError:pass
 
-def run_predict(input_csv,output_csv,timeout=300):
+def run_predict(input_csv,output_csv,timeout=60):
     artifact_size_and_validate()
     if not PREDICT.exists() or not PREDICT.is_file() or PREDICT.stat().st_size==0: raise AssertionError('/output/predict.py missing or empty')
     sandbox=pathlib.Path(tempfile.mkdtemp(prefix='oe_exec_',dir='/var/tmp' if pathlib.Path('/var/tmp').exists() else None)); artifact=sandbox/'artifact'
@@ -215,7 +229,7 @@ def ndcg_at_10(pred,target):
     if not target:return 0.0
     dcg=sum(1/math.log2(rank+1) for rank,item in enumerate(pred,1) if item in target); k=min(10,len(target)); idcg=sum(1/math.log2(rank+1) for rank in range(1,k+1)); return dcg/idcg if idcg else 0.0
 
-test schema
+schema
 from __future__ import annotations
 import csv,pathlib,tempfile
 from verifier_utils import artifact_size_and_validate,load_catalog,parse_predictions,run_predict,write_input
@@ -231,61 +245,6 @@ def _rows(n=4):
 def test_schema_determinism_and_order():
     artifact_size_and_validate(); catalog=load_catalog(); rows=_rows()
     with tempfile.TemporaryDirectory(prefix='oe_schema_') as td:
-        td=pathlib.Path(td); p=td/'in.csv'; o1=td/'o1.csv'; o2=td/'o2.csv'; pr=td/'rev.csv'; ro=td/'ro.csv'
-        write_input(p,rows); run_predict(p,o1,120); run_predict(p,o2,120); a=parse_predictions(o1,len(rows),catalog); b=parse_predictions(o2,len(rows),catalog); assert a==b,'submission is not deterministic'
-        write_input(pr,list(reversed(rows))); run_predict(pr,ro,120); c=parse_predictions(ro,len(rows),catalog); assert c==list(reversed(a)),'predictions must follow input row order'
-
-test main
-from __future__ import annotations
-import csv,json,math,pathlib,tempfile,resource
-from verifier_utils import artifact_size_and_validate,load_catalog,ndcg_at_10,parse_predictions,run_predict,write_input
-TEST_DIR=pathlib.Path(__file__).resolve().parent; LOG_DIR=pathlib.Path('/logs/verifier')
-
-def _load_cases():
-    out=[]
-    with (TEST_DIR/'test.csv').open(newline='',encoding='utf-8') as f:
-        r=csv.DictReader(f); assert r.fieldnames==['query_id','history','gaps_days','target_items'],f'bad test schema: {r.fieldnames}'
-        for row in r:
-            t={x for x in row['target_items'].split() if x}
-            if t: out.append((row['query_id'],row['history'],row['gaps_days'],t))
-    assert out,'empty test.csv'; return out
-
-def _score(preds,cases):
-    vals=[ndcg_at_10(p,c[3]) for p,c in zip(preds,cases)]; hits=[1.0 if any(x in c[3] for x in p) else 0.0 for p,c in zip(preds,cases)]; return sum(vals)/len(vals),sum(hits)/len(hits)
-
-def test_reward():
-    LOG_DIR.mkdir(parents=True,exist_ok=True); artifact_bytes=artifact_size_and_validate(); catalog=load_catalog(); cases=_load_cases(); config=json.loads((TEST_DIR/'scoring_config.json').read_text()); floor=float(config['popularity_ndcg_at_10'])
-    rows=[(c[0],c[1],c[2]) for c in cases]
-    with tempfile.TemporaryDirectory(prefix='oe_main_') as td:
-        td=pathlib.Path(td); p_in=td/'in.csv'; p_out=td/'out.csv'; p_rev=td/'rev.csv'; p_rev_out=td/'rev_out.csv'
-        write_input(p_in,rows); run_predict(p_in,p_out,timeout=600); preds=parse_predictions(p_out,len(cases),catalog)
-        write_input(p_rev,list(reversed(rows))); run_predict(p_rev,p_rev_out,timeout=600); rp=parse_predictions(p_rev_out,len(cases),catalog); assert rp==list(reversed(preds)),'predictions depend on input row position'
-    raw,hit=_score(preds,cases); reward=max(0.0,min(1.0,(raw-floor)/max(1e-12,1-floor))); assert math.isfinite(reward)
-    peak=resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss/1024.0
-    metrics={'reward':reward,'ndcg_at_10':raw,'popularity_ndcg_at_10':floor,'hit_rate_at_10':hit,'evaluated_customers':len(cases),'catalog_size':len(catalog),'artifact_bytes':artifact_bytes,'artifact_limit_bytes':65536,'customer_disjoint_eval':True,'peak_child_memory_mb':peak}
-    (LOG_DIR/'reward.txt').write_text(f'{reward:.12f}\n'); (LOG_DIR/'metrics.json').write_text(json.dumps(metrics,indent=2,sort_keys=True)+'\n')
-
-predict
-#!/usr/bin/env python3
-"""Author-only popularity smoke baseline; not an oracle/reference/optimum."""
-from __future__ import annotations
-import csv, pathlib, sys
-HERE=pathlib.Path(__file__).resolve().parent
-POPULAR=HERE/"popular_items.txt"
-
-def main():
-    if len(sys.argv)!=3: raise SystemExit("usage: predict.py <in.csv> <out.csv>")
-    items=POPULAR.read_text(encoding="utf-8").strip().split()
-    if len(items)<10: raise SystemExit("popular_items.txt missing/invalid")
-    pred=" ".join(items[:10])
-    with open(sys.argv[1],newline="",encoding="utf-8") as f:
-        r=csv.DictReader(f)
-        if r.fieldnames != ["query_id","history","gaps_days"]: raise SystemExit("bad input schema")
-        rows=list(r)
-    with open(sys.argv[2],"w",newline="",encoding="utf-8") as f:
-        w=csv.writer(f); w.writerow(["prediction"])
-        for _ in rows:w.writerow([pred])
-    return 0
-if __name__=="__main__": raise SystemExit(main())
-
+        td=pathlib.Path(td); p=td/'in.csv'; o1=td/'o1.csv'; o2=td/'o2.csv'
+        write_input(p,rows); run_predict(p,o1,60); run_predict(p,o2,60); a=parse_predictions(o1,len(rows),catalog); b=parse_predictions(o2,len(rows),catalog); assert a==b,'submission is not deterministic'
 
