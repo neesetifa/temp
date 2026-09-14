@@ -1,1 +1,0 @@
-{"id":"main_reward","rubric":"Macro NDCG@10 on novel next-basket items, mapped from an unseen-popularity floor through a fixed train-selected full-memory calibration anchor with continued headroom above the anchor, gated by a valid deterministic <=64 KiB self-contained inference artifact."}
