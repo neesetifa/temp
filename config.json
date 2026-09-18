@@ -1,0 +1,28 @@
+{
+  "model": {
+    "name": "knn",
+    "params": {
+      "k": 7,
+      "metric": "euclidean",
+      "weights": "uniform"
+    }
+  },
+  "budget": 200,
+  "n_classes": 4,
+  "dim": 8,
+  "n_pool": 5000,
+  "feature_cols": [
+    "f0",
+    "f1",
+    "f2",
+    "f3",
+    "f4",
+    "f5",
+    "f6",
+    "f7"
+  ],
+  "label_col": "y",
+  "id_col": "idx",
+  "random_seed": 20264919,
+  "note": "Select at most `budget` labelled rows for a fixed kNN. Each class lies on a thin curved manifold. The pool is polluted by mislabels, off-manifold rows and redundant dense knots. Unlike the uniform-margin parent problem, different stretches do not have the same classification margin: some class bands pass much closer together than others. A good subset must stay clean, preserve end-to-end support, and spend extra resolution where competing class manifolds are locally close."
+}
