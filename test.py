@@ -1,580 +1,414 @@
-# Task
+"""Reference eviction policy for kv_cache_eviction.
 
-`/app/model.npz` is a small pretrained decoder-only language model (4 layers, 4 heads per layer, head dim 32, RoPE). `/app/kvmodel.py` is its numpy inference code. `/app/data/train_tokens.npy` holds 800 token sequences (512 tokens each) from the private corpus the model was trained on.
+Everything here is derived from agent-visible material only: the model weights
+(/app/model.npz) and the training corpus (/app/data/train_tokens.npy).
 
-Write a KV-cache eviction policy in `/app/policy.py` so that the model behaves as closely as possible to its full-cache self under a small cache budget.
-
-## How the policy is run
-
-`TinyLM.run(tokens, policy, budget, chunk)` in `kvmodel.py` is exactly the loop the verifier uses:
-
-- sequences are processed in chunks of **32** tokens;
-- for each chunk and each layer (0..3), the chunk's queries attend to the entries still in that layer's cache plus the chunk itself (causal), the chunk's keys/values are appended, and then `policy.select(view)` returns, for every head, the indices of the entries to **keep**;
-- after the last layer of every chunk, the total number of entries over all layers and heads must be **at most 96** (the full cache reaches 8192). Heads and layers may hold different numbers of entries.
-
-The policy only selects entries; it cannot modify, merge or add keys/values. `view` is a `kvmodel.LayerView`, and its docstring lists every field. The policy never receives token ids.
-
-Required interface (see the starter `/app/policy.py`):
-
-```python
-class EvictionPolicy:
-    def __init__(self, config: dict): ...        # d, heads, layers, head_dim, vocab, chunk, seq_len, budget, app_dir
-    def begin_sequence(self, seq_len: int): ...  # optional
-    def select(self, view) -> list[np.ndarray]:  # one int index array (or bool mask) per head
-```
-
-## Scoring
-
-The verifier runs hidden sequences twice, once with the full cache and once with your policy. On every position after the first chunk it compares the next-token distributions using KL(full || yours), plus top-1 agreement on a subset of positions.
-
-Positions are grouped by the role their token plays in the sequence, and the groups are weighted separately. Each group's KL is scored on a log scale, from score 0 (roughly where generic attention-statistics policies such as heavy-hitter or observation-window eviction land) to score 1 (an idealized upper reference that a policy is not expected to reach). Part of the hidden set is drawn from a workload whose statistics differ from the training corpus.
-
-The reward is continuous in [0, 1]. `python /app/evaluate_local.py` gives a quick unweighted local estimate.
-
-## Rules
-
-- The verifier runs your policy in a separate, unprivileged process with no network. `select` sees only what is in `view`.
-- Your policy may read any files you place under `/app` (for example, tables or parameters you precompute), but must not write files at evaluation time.
-- The total policy compute for the hidden evaluation (about 7,700 `select` calls) must stay under 20 minutes on 4 CPU cores.
-- Exceeding the budget, returning invalid indices, crashing or timing out gives reward 0.
-
-
-
-hidden
-from __future__ import annotations
-
-import json
-from pathlib import Path
-import sys
-import time
-
-import numpy as np
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from generator import IN_DIST, SHIFTED, generate_corpus  # noqa: E402
-from kvmodel import TinyLM, BudgetViolation, PolicyContractError, kl_full_vs  # noqa: E402
-from sandbox_utils import PolicyClient, PolicyFailure, check_policy  # noqa: E402
-
-HERE = Path(__file__).resolve().parent
-MODEL_PATH = HERE / "model.npz"          # verifier-owned copy; /app/model.npz is never trusted
-
-CHUNK = 32
-SEQ_LEN = 512
-BUDGET = 96
-N_PER_SHARD = 60
-SHARDS = {
-    "in_dist": (IN_DIST, 424242),
-    "shifted": (SHIFTED, 515151),
-}
-SHARD_WEIGHTS = {"in_dist": 0.4, "shifted": 0.6}
-# Component weights inside a shard.
-COMPONENT_WEIGHTS = {"answer_kl": 0.45, "answer_top1": 0.20, "filler_kl": 0.20, "other_kl": 0.15}
-# Anchors (score 0 -> score 1), measured on these exact hidden shards at BUDGET=96.
-#  * KL components are interpolated in log space, top-1 agreement linearly.
-#  * Score 0 (unchanged from v0.1): answer_kl 2.0 nats / top-1 0.5; filler/other at
-#    the H2O baseline's value. Generic attention-statistics policies score 0.
-#  * Score 1 (v0.2): for every KL component, 0.8 x the better of
-#      - the privileged ORACLE (solution/oracle_policy.py: knows the hidden
-#        sequence, keeps what future queries actually attend to), and
-#      - the best value observed in the v0.1 frontier-agent probe (10 runs),
-#    so neither the oracle nor any observed agent saturates a component.
-#    top-1 agreement: score 1 at 1.0.
-#  ORACLE    in_dist: answer_kl 0.0054 top1 0.9972 filler_kl 0.0145 other_kl 0.1323
-#            shifted: answer_kl 0.0251 top1 0.9930 filler_kl 0.0279 other_kl 0.2491
-#  best agent in_dist: answer_kl 0.041  filler_kl 0.021  other_kl 0.088
-#  (v0.1)    shifted: answer_kl 0.127  filler_kl 0.038  other_kl 0.122
-#  H2O       in_dist: answer_kl 7.1839 top1 0.1286 filler_kl 0.7723 other_kl 0.6592
-#            shifted: answer_kl 7.8318 top1 0.0683 filler_kl 0.5875 other_kl 0.6650
-ANCHORS = {
-    "in_dist": {"answer_kl": (2.0, 0.00432), "answer_top1": (0.5, 1.0),
-                "filler_kl": (0.7723, 0.0116), "other_kl": (0.6592, 0.0704)},
-    "shifted": {"answer_kl": (2.0, 0.0201), "answer_top1": (0.5, 1.0),
-                "filler_kl": (0.5875, 0.0223), "other_kl": (0.6650, 0.0976)},
-}
-POLICY_TIMEOUT_SEC = 1200.0
-
-
-def policy_config():
-    m = TinyLM(MODEL_PATH)
-    return {"d": m.d, "heads": m.H, "layers": m.L, "head_dim": m.hd, "vocab": m.V,
-            "chunk": CHUNK, "seq_len": SEQ_LEN, "budget": BUDGET}
-
-
-def _score_kl(val, bad, good):
-    if not np.isfinite(val):
-        return 0.0
-    val = max(val, 1e-12)
-    t = (np.log(bad) - np.log(val)) / (np.log(bad) - np.log(good))
-    return float(np.clip(t, 0.0, 1.0))
-
-
-def _score_lin(val, bad, good):
-    return float(np.clip((val - bad) / (good - bad), 0.0, 1.0))
-
-
-def shard_metrics(full_lps, test_lps, labels):
-    kls, ans_agree, labs = [], [], []
-    for f, t, l in zip(full_lps, test_lps, labels):
-        kl = kl_full_vs(f, t)
-        kls.append(kl[CHUNK:-1])
-        labs.append(l[CHUNK:-1])
-        a = l[CHUNK:-1] == 1
-        ans_agree.append((f[CHUNK:-1].argmax(-1) == t[CHUNK:-1].argmax(-1))[a])
-    kl = np.concatenate(kls)
-    lab = np.concatenate(labs)
-    other = (lab == 0) | (lab == 2)
-    return {
-        "answer_kl": float(kl[lab == 1].mean()),
-        "answer_top1": float(np.concatenate(ans_agree).mean()),
-        "filler_kl": float(kl[lab == 3].mean()),
-        "other_kl": float(kl[other].mean()),
-        "n_answer": int((lab == 1).sum()),
-        "n_filler": int((lab == 3).sum()),
-        "n_other": int(other.sum()),
-    }
-
-
-def score_metrics(per_shard):
-    reward = 0.0
-    detail = {}
-    for name, m in per_shard.items():
-        comp = {}
-        for c, wt in COMPONENT_WEIGHTS.items():
-            bad, good = ANCHORS[name][c]
-            comp[c] = _score_lin(m[c], bad, good) if c == "answer_top1" else _score_kl(m[c], bad, good)
-        s = sum(COMPONENT_WEIGHTS[c] * comp[c] for c in COMPONENT_WEIGHTS)
-        detail[name] = {"metrics": m, "component_scores": comp, "shard_score": s}
-        reward += SHARD_WEIGHTS[name] * s
-    return float(np.clip(reward, 0.0, 1.0)), detail
-
-
-def hidden_shards():
-    out = {}
-    for name, (wl, seed) in SHARDS.items():
-        toks, labs, _ = generate_corpus(seed, N_PER_SHARD, wl, T=SEQ_LEN)
-        out[name] = (toks, labs)
-    return out
-
-
-def evaluate_policy_object(policy, model=None, shards=None, full_cache=None):
-    """Author/local path: run a policy object (in-process). Returns per-shard metrics."""
-    model = model or TinyLM(MODEL_PATH)
-    shards = shards or hidden_shards()
-    per = {}
-    for name, (toks, labs) in shards.items():
-        fulls = full_cache[name] if full_cache else [model.run(t) for t in toks]
-        tests = [model.run(t, policy=policy, budget=BUDGET, chunk=CHUNK) for t in toks]
-        per[name] = shard_metrics(fulls, tests, labs)
-    return per
-
-
-def evaluate(policy_path: str | Path, write_dir: str | Path | None = None):
-    t0 = time.time()
-    policy_path = Path(policy_path)
-    if not check_policy(policy_path):
-        return _finish(0.0, {"error": "api_missing"}, write_dir)
-    model = TinyLM(MODEL_PATH)
-    shards = hidden_shards()
-    client = None
-    try:
-        client = PolicyClient(policy_path, policy_config(), total_timeout=POLICY_TIMEOUT_SEC)
-        per = {}
-        for name, (toks, labs) in shards.items():
-            fulls, tests = [], []
-            for t in toks:
-                fulls.append(model.run(t))
-                tests.append(model.run(t, policy=client, budget=BUDGET, chunk=CHUNK))
-            per[name] = shard_metrics(fulls, tests, labs)
-    except BudgetViolation as exc:
-        return _finish(0.0, {"error": "budget_violation", "detail": str(exc)}, write_dir)
-    except PolicyContractError as exc:
-        return _finish(0.0, {"error": "contract_violation", "detail": str(exc)}, write_dir)
-    except PolicyFailure as exc:
-        return _finish(0.0, {"error": exc.code, "detail": exc.detail[-1500:]}, write_dir)
-    except Exception as exc:  # pragma: no cover
-        return _finish(0.0, {"error": "runtime_error", "detail": repr(exc)[-1500:]}, write_dir)
-    finally:
-        if client is not None:
-            client.close()
-    reward, detail = score_metrics(per)
-    metrics = {"reward": reward, "shards": detail, "wall_sec": round(time.time() - t0, 1)}
-    return _finish(reward, metrics, write_dir)
-
-
-def _finish(reward, metrics, write_dir=None):
-    if write_dir is not None:
-        p = Path(write_dir)
-        p.mkdir(parents=True, exist_ok=True)
-        (p / "reward.txt").write_text(f"{float(reward):.12f}\n")
-        (p / "metrics.json").write_text(json.dumps(metrics, indent=2, sort_keys=True))
-    return float(reward), metrics
-
-
-if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("policy_path")
-    ap.add_argument("--out", default=None)
-    ns = ap.parse_args()
-    r, m = evaluate(ns.policy_path, ns.out)
-    print(json.dumps(m, indent=2, sort_keys=True))
-
-resource
-#!/usr/bin/env python3
-"""Re-score existing verifier metrics.json files with the current anchors.
-
-    python rescore.py run1/metrics.json run2/metrics.json ...
-
-Uses the raw per-shard metrics recorded by hidden_eval (unchanged between v0.1
-and v0.2: same budget, same hidden shards), so no policy has to be re-run.
-"""
-import json
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hidden_eval import score_metrics  # noqa: E402
-
-for path in sys.argv[1:]:
-    m = json.load(open(path))
-    if "shards" not in m:
-        print(f"{path}: no shard metrics ({m.get('error')}) -> 0.0")
-        continue
-    per = {k: v["metrics"] for k, v in m["shards"].items()}
-    r, d = score_metrics(per)
-    comp = {s: {c: round(x, 3) for c, x in v["component_scores"].items()} for s, v in d.items()}
-    print(f"{path}: old={m.get('reward', float('nan')):.4f} new={r:.4f} {json.dumps(comp)}")
-
-solve.sh
-
-#!/bin/bash
-# Install the privileged ORACLE policy into /app (defines the top of the reward scale).
-set -euo pipefail
-HERE="$(cd "$(dirname "$0")" && pwd)"
-TESTS="${TESTS_DIR:-/tests}"
-cp "$HERE/oracle_policy.py" /app/policy.py
-cp "$HERE/oracle_params.npz" /app/oracle_params.npz
-cp "$HERE/legit_reference/policy.py" /app/oracle_roles.py
-if [ -f "$HERE/oracle_generator.py" ]; then
-  cp "$HERE/oracle_generator.py" /app/oracle_generator.py
-else
-  cp "$TESTS/generator.py" /app/oracle_generator.py
-fi
-
-oracle_policy
-
-"""Private synthetic token language for the kv-cache eviction task.
-
-Verifier-side only. The agent receives pre-generated training token sequences,
-never this file.
-
-Token map
----------
-0            BOS
-1            DEF   (start of a fact:  [PIN] DEF key val)
-2            PIN   (optional marker before DEF)
-3            ASK   (fact lookup:      ASK key val)
-4            QO    (quote open:       QO w1..wn QC)
-5            QC    (quote close)
-6            RE    (re-quote:         RE w1..wn QC  -- exact copy of an earlier quote)
-7..10        TOPIC markers; filler words follow the bigram table of the latest topic
-11..15       unused / reserved
-16..79       64 word tokens
-80..143      64 key tokens
-144..191     48 value tokens
-192..255     64 quote-word tokens (quotes and re-quotes only)
-
-Slice labels are attached to the *predicting* position t (the model's output at
-t predicts token t+1):
-  0 = other / filler
-  1 = fact answer   (t is the key position in "ASK key", next token = val)
-  2 = quote copy    (t inside a re-quote, next token is the copied word or QC)
-  3 = filler word   (t is a filler word and t+1 is a filler word)
+1. Token recovery. Layer-0 pre-RoPE keys are a deterministic function of the
+   token id (RMSNorm(emb[tok]) @ Wk_0), so the policy decodes each new chunk's
+   tokens exactly from view.keys at layer 0 and keeps its own token history.
+2. Role features. From the recovered history it derives the role of every
+   cached position in the corpus grammar (fact value, pinned fact, key asked
+   already, quote word / quote length / already re-quoted, topic marker and
+   whether it was superseded, ...), plus recency and attention statistics.
+3. Learned future importance. A gradient-boosted model trained offline on the
+   training corpus predicts, for (layer, head, position), the maximum
+   attention that *future* queries will pay to the entry under the full cache.
+4. Allocation. Per-layer budget shares and per-head importance multipliers
+   are tuned offline (objective: mean over position groups -- fact answers,
+   filler words, everything else, as recovered by the same parse -- of log
+   mean KL on training sequences); inside a layer the entries of all heads
+   compete in a single top-k on weighted predicted importance.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from pathlib import Path
 import numpy as np
 
-BOS, DEF, PIN, ASK, QO, QC, RE = 0, 1, 2, 3, 4, 5, 6
-TOPIC0, N_TOPIC = 7, 4
-WORD0, N_WORD = 16, 64
-KEY0, N_KEY = 80, 64
-VAL0, N_VAL = 144, 48
-QWORD0, N_QWORD = 192, 64
-VOCAB = 256
-SEQ_LEN = 512
-N_HOT_KEYS = 16
+EPS = 1e-6
 
-_TABLE_SEED = 0x5EED_4B56
+# token classes (recovered by inspecting the training corpus)
+C_BOS, C_DEF, C_PIN, C_ASK, C_QO, C_QC, C_RE, C_TOPIC, C_WORD, C_KEY, C_VAL, C_OTHER = range(12)
+
+ROLE_OTHER, ROLE_FILLER, ROLE_FACT_DEF, ROLE_FACT_KEY, ROLE_FACT_VAL, ROLE_ASK, ROLE_ASK_KEY, \
+    ROLE_ASK_VAL, ROLE_QUOTE, ROLE_REQUOTE, ROLE_TOPIC, ROLE_BOS, ROLE_PIN, ROLE_QMARK = range(14)
 
 
-def _markov_table():
-    rng = np.random.default_rng(_TABLE_SEED)
-    succ = np.zeros((N_TOPIC, N_WORD, 3), dtype=np.int64)
-    for z in range(N_TOPIC):
-        for a in range(N_WORD):
-            succ[z, a] = rng.choice(N_WORD, size=3, replace=False)
-    return succ
+def tok_class(t):
+    t = np.asarray(t)
+    c = np.full(t.shape, C_OTHER, dtype=np.int64)
+    c[t == 0] = C_BOS
+    c[t == 1] = C_DEF
+    c[t == 2] = C_PIN
+    c[t == 3] = C_ASK
+    c[t == 4] = C_QO
+    c[t == 5] = C_QC
+    c[t == 6] = C_RE
+    c[(t >= 7) & (t <= 10)] = C_TOPIC
+    c[(t >= 16) & (t < 80)] = C_WORD
+    c[(t >= 80) & (t < 144)] = C_KEY
+    c[(t >= 144) & (t < 192)] = C_VAL
+    return c
 
 
-_SUCC = _markov_table()
-_SUCC_P = np.array([0.6, 0.25, 0.15])
+class SeqState:
+    """Incremental parse of the recovered token history."""
 
+    def __init__(self, T):
+        self.T = T
+        self.tok = np.full(T, -1, dtype=np.int64)
+        self.n = 0
+        self.role = np.zeros(T, dtype=np.int64)
+        self.pinned = np.zeros(T, dtype=np.int64)
+        self.key_of = np.full(T, -1, dtype=np.int64)     # key id associated with a fact position
+        self.quote_id = np.full(T, -1, dtype=np.int64)
+        self.quote_off = np.full(T, -1, dtype=np.int64)
+        self.quotes = []                                  # [start, length, n_requoted]
+        self.fact_pos = {}                                # key -> [def_pos, key_pos, val_pos]
+        self.asks = {}                                    # key -> list of ask positions
+        self.topics = []                                  # positions of topic markers
+        self._mode = None
+        self._cur_quote = None
+        self._re_words = None
 
-@dataclass(frozen=True)
-class Workload:
-    p_fact: float
-    p_quote: float
-    p_pin: float
-    p_query_plain: float
-    short_gap_mean: float
-    long_gap_min: int
-    p_hot_extra: float
-    p_requote_long: float
-    p_requote_short: float
-    topic_len_mean: float
+    def push(self, toks):
+        for t in toks:
+            self._push1(int(t))
 
-
-IN_DIST = Workload(
-    p_fact=0.060, p_quote=0.012, p_pin=0.35, p_query_plain=0.40,
-    short_gap_mean=36.0, long_gap_min=60, p_hot_extra=0.5,
-    p_requote_long=0.75, p_requote_short=0.20, topic_len_mean=110.0,
-)
-
-SHIFTED = Workload(
-    p_fact=0.090, p_quote=0.016, p_pin=0.50, p_query_plain=0.40,
-    short_gap_mean=70.0, long_gap_min=90, p_hot_extra=0.5,
-    p_requote_long=0.80, p_requote_short=0.20, topic_len_mean=170.0,
-)
-
-
-def generate_sequence(rng: np.random.Generator, wl: Workload, T: int = SEQ_LEN):
-    toks = [BOS]
-    labels = [0]
-    src = [-1]          # for labeled positions: position of the dependency source
-    used_keys = set()
-    facts = {}          # key -> (val, pos_of_val)
-    quotes = []         # list of (start_pos_of_w1, words)
-    sched = []          # (due, kind, payload)
-    a = int(rng.integers(N_WORD))
-    topic = int(rng.integers(N_TOPIC))
-    topic_left = 0
-    prev_filler = False
-
-    def emit(tok, lab=0, s=-1):
-        toks.append(int(tok))
-        labels.append(0)
-        src.append(-1)
-        # label belongs to the predicting position (previous index)
-        if lab:
-            labels[-2] = lab
-            src[-2] = s
-
-    while len(toks) < T:
-        t = len(toks)
-        due = [i for i, it in enumerate(sched) if it[0] <= t]
-        if due:
-            i = min(due, key=lambda j: sched[j][0])
-            _, kind, payload = sched.pop(i)
-            if kind == "ask":
-                key = payload
-                val, vpos = facts[key]
-                emit(ASK)
-                emit(key)
-                emit(val, lab=1, s=vpos)
+    def _push1(self, t):
+        p = self.n
+        self.tok[p] = t
+        self.n += 1
+        prev = self.tok[p - 1] if p >= 1 else -1
+        prev2 = self.tok[p - 2] if p >= 2 else -1
+        c = int(tok_class([t])[0])
+        role = ROLE_OTHER
+        if c == C_BOS:
+            role = ROLE_BOS
+        elif c == C_PIN:
+            role = ROLE_PIN
+        elif c == C_DEF:
+            role = ROLE_FACT_DEF
+            if prev == 2:
+                self.pinned[p] = 1
+        elif c == C_ASK:
+            role = ROLE_ASK
+        elif c == C_TOPIC:
+            role = ROLE_TOPIC
+            self.topics.append(p)
+            self._mode = None
+        elif c == C_QO:
+            role = ROLE_QMARK
+            self._mode = "quote"
+            self._cur_quote = [p + 1, 0, 0]
+            self.quotes.append(self._cur_quote)
+        elif c == C_RE:
+            role = ROLE_QMARK
+            self._mode = "requote"
+            self._re_words = []
+        elif c == C_QC:
+            role = ROLE_QMARK
+            if self._mode == "requote" and self._re_words:
+                for q in self.quotes:
+                    L = q[1]
+                    if L == len(self._re_words) and list(self.tok[q[0]:q[0] + L]) == self._re_words:
+                        q[2] += 1
+                        break
+            self._mode = None
+        elif c == C_KEY:
+            if prev == 1:
+                role = ROLE_FACT_KEY
+                self.key_of[p] = t
+                self.pinned[p] = self.pinned[p - 1]
+                self.fact_pos[t] = [p - 1, p, -1]
+            elif prev == 3:
+                role = ROLE_ASK_KEY
+                self.key_of[p] = t
+                self.asks.setdefault(t, []).append(p)
+                self.key_of[p - 1] = t
+        elif c == C_VAL:
+            if prev2 == 1 and tok_class([prev])[0] == C_KEY:
+                role = ROLE_FACT_VAL
+                self.key_of[p] = prev
+                self.pinned[p] = self.pinned[p - 1]
+                if prev in self.fact_pos:
+                    self.fact_pos[prev][2] = p
+            elif prev2 == 3:
+                role = ROLE_ASK_VAL
+                self.key_of[p] = prev
+        elif c == C_WORD:
+            if self._mode == "quote":
+                role = ROLE_QUOTE
+                q = self._cur_quote
+                self.quote_id[p] = len(self.quotes) - 1
+                self.quote_off[p] = q[1]
+                q[1] += 1
+            elif self._mode == "requote":
+                role = ROLE_REQUOTE
+                self._re_words.append(t)
             else:
-                qstart, words = quotes[payload]
-                emit(RE)
-                emit(words[0])
-                for j, w in enumerate(words[1:]):
-                    emit(w, lab=2, s=qstart + j + 1)
-                emit(QC, lab=2, s=qstart + len(words))
-            continue
-        u = rng.random()
-        if u < wl.p_fact and len(used_keys) < N_KEY:
-            free = [k for k in range(N_KEY) if k not in used_keys]
-            kidx = int(rng.choice(free))
-            used_keys.add(kidx)
-            key = KEY0 + kidx
-            val = VAL0 + int(rng.integers(N_VAL))
-            pinned = rng.random() < wl.p_pin
-            if pinned:
-                emit(PIN)
-            emit(DEF)
-            emit(key)
-            emit(val)
-            vpos = len(toks) - 1
-            facts[key] = (val, vpos)
-            t = len(toks)
-            if pinned:
-                nq = 1 + int(rng.random() < 0.4)
-                for _ in range(nq):
-                    sched.append((t + int(rng.integers(wl.long_gap_min, T)), "ask", key))
-            elif rng.random() < wl.p_query_plain:
-                sched.append((t + 6 + int(rng.geometric(1.0 / wl.short_gap_mean)), "ask", key))
-            if kidx < N_HOT_KEYS and rng.random() < wl.p_hot_extra:
-                sched.append((t + int(rng.integers(20, T)), "ask", key))
-        elif u < wl.p_fact + wl.p_quote:
-            n = int(rng.integers(3, 9))
-            words = [QWORD0 + int(w) for w in rng.integers(0, N_QWORD, size=n)]
-            emit(QO)
-            qstart = len(toks)
-            for w in words:
-                emit(w)
-            emit(QC)
-            quotes.append((qstart, words))
-            p_re = wl.p_requote_long if n >= 6 else wl.p_requote_short
-            if rng.random() < p_re:
-                sched.append((len(toks) + int(rng.integers(20, T)), "re", len(quotes) - 1))
-        else:
-            if topic_left <= 0:
-                topic = int((topic + rng.integers(1, N_TOPIC)) % N_TOPIC)
-                topic_left = int(rng.geometric(1.0 / wl.topic_len_mean))
-                emit(TOPIC0 + topic)
-                prev_filler = False
-                continue
-            c = int(_SUCC[topic, a][rng.choice(3, p=_SUCC_P)])
-            emit(WORD0 + c, lab=3 if prev_filler else 0)
-            a = c
-            topic_left -= 1
-            prev_filler = True
-            continue
-        prev_filler = False
-    return (np.asarray(toks[:T], dtype=np.int64),
-            np.asarray(labels[:T], dtype=np.int64),
-            np.asarray(src[:T], dtype=np.int64))
+                role = ROLE_FILLER
+        self.role[p] = role
+
+    def features(self, pos, e):
+        """Feature matrix for cached positions `pos` at eviction time e (exclusive)."""
+        pos = np.asarray(pos, dtype=np.int64)
+        n = pos.shape[0]
+        tok = self.tok[pos]
+        role = self.role[pos]
+        F = np.zeros((n, 20))
+        F[:, 0] = e - 1 - pos
+        F[:, 1] = pos / self.T
+        F[:, 2] = (self.T - e) / self.T
+        F[:, 3] = role
+        F[:, 4] = tok_class(tok)
+        prevt = np.where(pos >= 1, self.tok[np.maximum(pos - 1, 0)], -1)
+        F[:, 5] = tok_class(prevt)
+        F[:, 6] = self.pinned[pos]
+        key = self.key_of[pos]
+        F[:, 7] = np.where(key >= 0, key - 80, -1)
+        n_ask = np.zeros(n)
+        last_ask = np.full(n, -1.0)
+        is_fact = (key >= 0) & np.isin(role, (ROLE_FACT_KEY, ROLE_FACT_VAL, ROLE_FACT_DEF))
+        for i in np.flatnonzero(is_fact):
+            lst = self.asks.get(int(key[i]))
+            if lst:
+                a = [x for x in lst if pos[i] < x < e]
+                n_ask[i] = len(a)
+                if a:
+                    last_ask[i] = e - a[-1]
+        F[:, 8] = n_ask
+        F[:, 9] = last_ask
+        qid = self.quote_id[pos]
+        qinfo = np.array([[q[1], q[2]] for q in self.quotes] + [[-1, -1]], dtype=float)
+        qlen = qinfo[qid, 0]
+        qre = qinfo[qid, 1]
+        F[:, 10] = qlen
+        F[:, 11] = self.quote_off[pos]
+        F[:, 12] = qre
+        topics = np.asarray(self.topics, dtype=np.int64)
+        tp = topics[topics < e]
+        latest = tp.max() if tp.size else -1
+        F[:, 13] = (role == ROLE_TOPIC) & (pos != latest)
+        F[:, 14] = (pos == latest)
+        F[:, 15] = len([1 for k, v in self.fact_pos.items() if v[2] >= 0 and v[2] < e])
+        # tokens since the last topic marker (for filler)
+        F[:, 16] = e - 1 - latest if latest >= 0 else e
+        return F
 
 
-def generate_corpus(seed: int, n: int, wl: Workload = IN_DIST, T: int = SEQ_LEN):
-    rng = np.random.default_rng(seed)
-    toks = np.zeros((n, T), dtype=np.int64)
-    labs = np.zeros((n, T), dtype=np.int64)
-    srcs = np.zeros((n, T), dtype=np.int64)
-    for i in range(n):
-        toks[i], labs[i], srcs[i] = generate_sequence(rng, wl, T)
-    # The final position predicts nothing.
-    labs[:, -1] = 0
-    return toks, labs, srcs
+N_ATT_FEATS = 4
 
 
-if __name__ == "__main__":
-    for name, wl in (("in", IN_DIST), ("shift", SHIFTED)):
-        t, l, s = generate_corpus(1, 200, wl)
-        pos = np.arange(t.shape[1])[None, :]
-        gap1 = (pos - s)[l == 1]
-        gap2 = (pos - s)[l == 2]
-        print(name, "filler", (l == 3).sum(1).mean(), "topics", ((t >= 7) & (t < 11)).sum(1).mean())
-        print(name, "facts/seq", (t == DEF).sum(1).mean(), "pins", (t == PIN).sum(1).mean(),
-              "asks", (l == 1).sum(1).mean(), "quotes", (t == QO).sum(1).mean(), "requote toks", (l == 2).sum(1).mean(),
-              "ans gap med/p90", np.median(gap1), np.percentile(gap1, 90), "copy gap med", np.median(gap2))
-    print(t[0][:120])
+def predict_trees(a, X):
+    """Evaluate exported HistGradientBoosting trees (plain numpy)."""
+    X = np.asarray(X, dtype=np.float64)
+    n = X.shape[0]
+    feat, thr, left, right = a["t_feat"], a["t_thr"], a["t_left"], a["t_right"]
+    leaf, val, mgl, off = a["t_leaf"], a["t_val"], a["t_mgl"], a["t_off"]
+    roots = off[:-1]
+    # all (row, tree) pairs advance one level per iteration
+    g = np.broadcast_to(roots[None, :], (n, roots.size)).copy()     # global node ids
+    rows = np.broadcast_to(np.arange(n)[:, None], g.shape)
+    base = np.broadcast_to(roots[None, :], g.shape)
+    while True:
+        act = leaf[g] == 0
+        if not act.any():
+            break
+        ga = g[act]
+        x = X[rows[act], feat[ga]]
+        go_left = np.where(np.isnan(x), mgl[ga] == 1, x <= thr[ga])
+        g[act] = base[act] + np.where(go_left, left[ga], right[ga])
+    return float(a["t_base"]) + val[g].sum(1)
 
-oracle policy
-"""Privileged ORACLE eviction policy for kv_cache_eviction (uses the hidden mechanism).
 
-Not a legitimate solution: it regenerates the hidden evaluation sequences from
-the task generator (fixed seeds), identifies the current sequence from its first
-chunk (tokens decoded exactly from layer-0 keys), computes the full-cache
-attention of every FUTURE query, and keeps the entries that future queries will
-actually use. Selection = per-layer budget share, then a single in-layer top-k on
-  head_w[l,h] * role_w[role(p)] * (max_future_attn^alpha + beta * mean_future_attn)
-with the knobs tuned on training sequences (oracle_params.npz).
+def fact_features(st, e, key_rate):
+    """Fact-level features for every fact value position < e (planned mode)."""
+    vpos = np.flatnonzero(st.role[:e] == ROLE_FACT_VAL)
+    F = np.zeros((vpos.size, 7))
+    for i, p in enumerate(vpos):
+        k = int(st.key_of[p])
+        asks = [x for x in st.asks.get(k, []) if p < x < e]
+        F[i] = [st.pinned[p], key_rate[k - 80] if 80 <= k < 144 else 0.0, len(asks),
+                (e - asks[-1]) if asks else -1.0, e - 1 - p, st.T - e, p]
+    return vpos, F
 
-solve.sh installs it as /app/policy.py together with oracle_params.npz,
-oracle_generator.py (= tests/generator.py) and oracle_roles.py (= legit reference
-policy module, used only for its token-role parser).
-"""
-from __future__ import annotations
 
-from pathlib import Path
-import sys
-
-import numpy as np
-
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-
-HIDDEN = (("IN_DIST", 424242), ("SHIFTED", 515151))
-N_PER_SHARD = 60
+def decode_table(w):
+    g = w["g1_0"]
+    emb = w["emb"]
+    a = emb / np.sqrt(np.mean(emb * emb, axis=-1, keepdims=True) + EPS) * g
+    return a @ w["Wk_0"]                     # (V, d) pre-RoPE layer-0 keys
 
 
 class EvictionPolicy:
-    def __init__(self, config):
-        import oracle_generator as G
-        from oracle_roles import SeqState
-        from kvmodel import TinyLM
-        self.SeqState = SeqState
-        app = Path(config.get("app_dir", HERE))
-        mp = next(p for p in (app / "model.npz", HERE / "model.npz", Path("/app/model.npz")) if p.exists())
-        self.m = TinyLM(mp)
-        self.L, self.H = self.m.L, self.m.H
+    def __init__(self, config, assets=None):
+        self.cfg = config
+        self.L, self.H = int(config["layers"]), int(config["heads"])
         self.budget = int(config["budget"])
-        with np.load(HERE / "oracle_params.npz", allow_pickle=False) as z:
-            p = {k: z[k] for k in z.files}
-        self.p = {"layer_frac": p["layer_frac"].astype(float), "head_w": p["head_w"].astype(float),
-                  "role_w": p["role_w"].astype(float), "alpha": float(p["alpha"]),
-                  "beta": float(p["beta"]), "min_recent": int(p["min_recent"])}
-        self.lookup = {}
-        for wl_name, seed in HIDDEN:
-            toks, _, _ = G.generate_corpus(seed, N_PER_SHARD, getattr(G, wl_name), T=int(config["seq_len"]))
-            for t in toks:
-                self.lookup[tuple(int(x) for x in t[:int(config["chunk"])])] = t
-        w = self.m.w
-        emb = w["emb"]
-        a = emb / np.sqrt(np.mean(emb * emb, -1, keepdims=True) + 1e-6) * w["g1_0"]
-        self.table = a @ w["Wk_0"]
+        here = Path(__file__).resolve().parent
+        app = Path(config.get("app_dir", "/app"))
+        cands = [app / "model.npz", here / "model.npz", Path("/app/model.npz")]
+        wpath = next((c for c in cands if c.exists()), cands[0])
+        with np.load(wpath, allow_pickle=False) as z:
+            w = {k: np.asarray(z[k], dtype=np.float64) for k in ("emb", "g1_0", "Wk_0")}
+        self.table = decode_table(w)
+        if assets is None:
+            path = here / "ref_assets.npz"
+            if not path.exists():
+                path = app / "ref_assets.npz"
+            with np.load(path, allow_pickle=False) as z:
+                assets = {k: z[k] for k in z.files}
+        self.assets = assets
+        self.layer_frac = np.asarray(assets["layer_frac"], dtype=float)
+        self.min_recent = int(assets["min_recent"])
+        self.planned = "fact_heads" in assets and "fact_w" not in assets
+        self.hybrid = "fact_w" in assets
+        if self.hybrid:
+            self.fact_w = float(assets["fact_w"])
+            self.fact_b = float(assets.get("fact_b", 0.0))
+        if "fact_heads" in assets:
+            self.fact_heads = np.asarray(assets["fact_heads"], dtype=np.int64)     # (k, 2) layer, head
+            self.topic_heads = np.asarray(assets["topic_heads"], dtype=np.int64)
+            self.fact_cap = np.asarray(assets.get("fact_cap", np.zeros(len(self.fact_heads))), dtype=float)
+            self.key_rate = np.asarray(assets["key_rate"], dtype=float)
+            self.q_assets = {"t_" + k[2:]: v for k, v in assets.items() if k.startswith("q_")}
+        hw = assets.get("head_w")
+        self.head_w = np.ones((self.L, self.H)) if hw is None else np.asarray(hw, dtype=float)
 
     def begin_sequence(self, seq_len):
-        self.ready = False
+        self.st = SeqState(seq_len)
+        self.acc = {}
+        self._fact_cache = None
 
-    def _prepare(self, view):
+    # ---- planned mode -------------------------------------------------
+    def _special(self):
+        sp = {}
+        for i, (l, h) in enumerate(self.fact_heads):
+            sp[(int(l), int(h))] = ("fact", max(1, int(round(self.fact_cap[i] * self.budget))))
+        for l, h in self.topic_heads:
+            sp[(int(l), int(h))] = ("topic", 2)
+        return sp
+
+    def _fact_scores(self, e):
+        if self._fact_cache is not None and self._fact_cache[0] == e:
+            return self._fact_cache[1]
+        vpos, F = fact_features(self.st, e, self.key_rate)
+        pr = predict_trees(self.q_assets, F) if vpos.size else np.zeros(0)
+        sc = np.zeros(self.st.T)
+        sc[vpos] = pr
+        self._fact_cache = (e, sc)
+        return sc
+
+    def _select_planned(self, view):
+        e = view.chunk_end
+        sp = self._special()
+        special_total = sum(c for _, c in sp.values())
+        rest = max(0, self.budget - special_total)
+        keep = [None] * self.H
+        others = []
+        for h, pos in enumerate(view.positions):
+            role = sp.get((view.layer, h))
+            if role is None:
+                others.append(h)
+                continue
+            kind, cap = role
+            if kind == "fact":
+                fs = self._fact_scores(e)
+                isf = self.st.role[pos] == ROLE_FACT_VAL
+                sc = np.where(isf, 1.0 + fs[pos], 0.0) + 1e-6 * pos
+            else:
+                tp = np.flatnonzero(self.st.role[:e] == ROLE_TOPIC)
+                latest = tp.max() if tp.size else -1
+                sc = 2.0 * (pos == latest) + 1e-6 * pos
+            k = min(cap, len(pos))
+            keep[h] = np.sort(np.argpartition(-sc, k - 1)[:k]) if 0 < k < len(pos) else np.arange(len(pos))[:k]
+        if others:
+            other_layers = sorted({l for l in range(self.L)
+                                   if any((l, h) not in sp for h in range(self.H))})
+            fr = self.layer_frac[other_layers]
+            fr = fr / fr.sum()
+            lb = int(rest * fr[other_layers.index(view.layer)])
+            feats, owners, locals_ = [], [], []
+            for h in others:
+                pos, A = view.positions[h], view.attn[h]
+                F = self.st.features(pos, e)
+                acc = self.acc.setdefault((view.layer, h), np.zeros(self.st.T))
+                acc[pos] += A.sum(0)
+                att = np.stack([A.mean(0), A.max(0), A[-4:].mean(0), acc[pos] / np.maximum(1, e - pos)], 1)
+                lh = np.full((len(pos), 2), [view.layer, view.layer * self.H + h], dtype=float)
+                feats.append(np.concatenate([F, att, lh], 1))
+                owners.append(np.full(len(pos), h))
+                locals_.append(np.arange(len(pos)))
+            owner = np.concatenate(owners)
+            local = np.concatenate(locals_)
+            score = predict_trees(self.assets, np.concatenate(feats)) * self.head_w[view.layer][owner]
+            pos_all = np.concatenate([view.positions[h] for h in others])
+            score = score + 10.0 * (pos_all >= e - self.min_recent)
+            k = min(lb, score.shape[0])
+            top = np.argpartition(-score, k - 1)[:k] if 0 < k < score.shape[0] else np.arange(score.shape[0])[:k]
+            sel = {h: [] for h in others}
+            for j in top:
+                sel[owner[j]].append(local[j])
+            for h in others:
+                keep[h] = np.sort(np.asarray(sel[h], dtype=np.int64))
+        return keep
+
+    def _decode(self, view):
         C = view.chunk_end - view.chunk_start
-        K = np.concatenate([k[-C:] for k in view.keys], 1)
-        pref = tuple(int(x) for x in ((K[:, None] - self.table[None]) ** 2).sum(-1).argmin(1))
-        tokens = np.asarray(self.lookup[pref])
-        T = len(tokens)
-        A = np.zeros((self.L, self.H, T, T))
+        K = np.concatenate([k[-C:] for k in view.keys], axis=1)     # (C, d)
+        d2 = ((K[:, None, :] - self.table[None, :, :]) ** 2).sum(-1)
+        return d2.argmin(1)
 
-        def cb(l, s, e, hh, pos, P):
-            A[l, hh, s:e][:, pos] = P
-
-        self.m.run(tokens, collect=cb, chunk=T)
-        self.fut_max = np.maximum.accumulate(A[:, :, ::-1, :], axis=2)[:, :, ::-1, :]
-        self.fut_sum = np.cumsum(A[:, :, ::-1, :], axis=2)[:, :, ::-1, :]
-        st = self.SeqState(T)
-        st.push(tokens)
-        self.role = st.role.copy()
-        self.T = T
-        self.ready = True
+    def layer_budget(self, view):
+        held_other = 0
+        for l in range(self.L):
+            if l < view.layer:
+                held_other += view.held[l]
+            elif l > view.layer:
+                # later layers still hold last chunk's entries; they will be cut to their share
+                held_other += min(view.held[l], int(self.layer_frac[l] * self.budget))
+        return int(min(self.layer_frac[view.layer] * self.budget, self.budget - held_other))
 
     def select(self, view):
-        if not self.ready:
-            self._prepare(view)
-        p, e, l = self.p, view.chunk_end, view.layer
-        frac = p["layer_frac"]
-        held_other = sum(view.held[ll] for ll in range(self.L) if ll < l) + \
-            sum(min(view.held[ll], int(frac[ll] * self.budget)) for ll in range(self.L) if ll > l)
-        lb = int(max(0, min(frac[l] * self.budget, self.budget - held_other)))
-        scores, owners, locals_ = [], [], []
-        for h, pos in enumerate(view.positions):
-            if e < self.T:
-                fm = self.fut_max[l, h, e, pos]
-                fs = self.fut_sum[l, h, e, pos] / (self.T - e)
-            else:
-                fm = fs = np.zeros(len(pos))
-            sc = p["head_w"][l, h] * p["role_w"][self.role[pos]] * (fm ** p["alpha"] + p["beta"] * fs)
-            scores.append(sc + 10.0 * (pos >= e - p["min_recent"]))
+        if view.layer == 0:
+            self.st.push(self._decode(view))
+        if self.planned:
+            return self._select_planned(view)
+        e = view.chunk_end
+        feats, owners, locals_ = [], [], []
+        for h, (pos, A) in enumerate(zip(view.positions, view.attn)):
+            F = self.st.features(pos, e)
+            acc = self.acc.setdefault((view.layer, h), np.zeros(self.st.T))
+            acc[pos] += A.sum(0)
+            att = np.stack([A.mean(0), A.max(0), A[-4:].mean(0),
+                            acc[pos] / np.maximum(1, e - pos)], 1)
+            lh = np.full((len(pos), 2), [view.layer, view.layer * self.H + h], dtype=float)
+            feats.append(np.concatenate([F, att, lh], 1))
             owners.append(np.full(len(pos), h))
             locals_.append(np.arange(len(pos)))
-        sc = np.concatenate(scores)
-        own = np.concatenate(owners)
-        loc = np.concatenate(locals_)
-        k = min(lb, sc.size)
-        top = np.argpartition(-sc, k - 1)[:k] if 0 < k < sc.size else np.arange(sc.size)[:k]
+        X = np.concatenate(feats)
+        owner = np.concatenate(owners)
+        score = predict_trees(self.assets, X) * self.head_w[view.layer][owner]
+        local = np.concatenate(locals_)
+        if self.hybrid:
+            pos_cat = np.concatenate(view.positions)
+            fs = self._fact_scores(e)
+            for l, h in self.fact_heads:
+                if l == view.layer:
+                    m = (owner == h) & (self.st.role[pos_cat] == ROLE_FACT_VAL)
+                    score[m] = self.fact_w * fs[pos_cat[m]] + self.fact_b
+            tp = np.flatnonzero(self.st.role[:e] == ROLE_TOPIC)
+            if tp.size:
+                for l, h in self.topic_heads:
+                    if l == view.layer:
+                        score[(owner == h) & (pos_cat == tp.max())] += 10.0
+        # always keep the newest entries of every head (cheap insurance for local heads)
+        pos_all = np.concatenate(view.positions)
+        score = score + 10.0 * (pos_all >= e - self.min_recent)
+        lb = max(0, self.layer_budget(view))
+        k = min(lb, score.shape[0])
+        top = np.argpartition(-score, k - 1)[:k] if 0 < k < score.shape[0] else np.arange(score.shape[0])[:k]
         keep = [[] for _ in range(self.H)]
         for j in top:
-            keep[own[j]].append(loc[j])
+            keep[owner[j]].append(local[j])
         return [np.sort(np.asarray(x, dtype=np.int64)) for x in keep]
-
-
