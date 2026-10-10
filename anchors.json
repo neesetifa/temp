@@ -1,0 +1,49 @@
+{
+ "_doc": "Per (split/join-type) anchors on mean |log q-error|. score=clip(log(L0/L)/log(L0/L1),0,1), L1=0.8*min(oracle, best_agent). L0 = sampling-with-independence-fallback baseline. reward = 0.35*mean(mid scores) + 0.65*mean(tail scores).",
+ "split_weights": {
+  "mid": 0.35,
+  "tail": 0.65
+ },
+ "groups": {
+  "mid/O": {
+   "L0": 0.1143,
+   "oracle": 0.0108,
+   "best_agent": null
+  },
+  "mid/OC": {
+   "L0": 0.1177,
+   "oracle": 0.0103,
+   "best_agent": null
+  },
+  "mid/OP": {
+   "L0": 0.1353,
+   "oracle": 0.0134,
+   "best_agent": null
+  },
+  "mid/OCP": {
+   "L0": 0.1201,
+   "oracle": 0.0137,
+   "best_agent": null
+  },
+  "tail/O": {
+   "L0": 0.2529,
+   "oracle": 0.033,
+   "best_agent": null
+  },
+  "tail/OC": {
+   "L0": 0.7397,
+   "oracle": 0.1366,
+   "best_agent": null
+  },
+  "tail/OP": {
+   "L0": 0.7553,
+   "oracle": 0.1416,
+   "best_agent": null
+  },
+  "tail/OCP": {
+   "L0": 0.674,
+   "oracle": 0.163,
+   "best_agent": null
+  }
+ }
+}
