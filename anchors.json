@@ -1,0 +1,36 @@
+{
+ "_doc": "Per-task anchors on mean KL(expert||merged) over 3000 hidden inputs. score=clip(log(L0/L)/log(L0/L1),0,1), L1=0.8*min(oracle,best_agent). L0 = distillation on the 64 visible inputs + N(0,0.3^2) input noise, 8k Adam steps. reward = mean over the 6 tasks.",
+ "groups": {
+  "task_0": {
+   "L0": 0.032004,
+   "oracle": 0.002539,
+   "best_agent": null
+  },
+  "task_1": {
+   "L0": 0.037234,
+   "oracle": 0.003952,
+   "best_agent": null
+  },
+  "task_2": {
+   "L0": 0.1174,
+   "oracle": 0.009772,
+   "best_agent": null
+  },
+  "task_3": {
+   "L0": 0.065318,
+   "oracle": 0.005621,
+   "best_agent": null
+  },
+  "task_4": {
+   "L0": 0.033183,
+   "oracle": 0.002945,
+   "best_agent": null
+  },
+  "task_5": {
+   "L0": 0.049341,
+   "oracle": 0.003428,
+   "best_agent": null
+  }
+ },
+ "_expected_oracle_reward": 0.916848
+}
