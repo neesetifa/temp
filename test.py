@@ -1,141 +1,47 @@
-#!/bin/bash
-# Run the grading test, then write /logs/verifier/reward.txt from metrics.json (0 on any failure).
-LOG=/logs/verifier
-mkdir -p "$LOG"
-rm -rf "$LOG/reward.txt" "$LOG/metrics.json" "$LOG/per_metric"
-# Grader-only paths: the codec runs as an unprivileged uid (see verifier_utils.run_codec).
-chmod 700 /tests
-[ -d /solution ] && chmod 700 /solution
-cd /tests
-python -m pytest -q -p no:cacheprovider /tests/test_smoke.py /tests/test_isolation.py /tests/test_main.py
-status=$?
-python - "$status" << 'PY'
-import json, math, pathlib, sys
-log = pathlib.Path('/logs/verifier')
-reward = 0.0
-if sys.argv[1] == '0':
-    try:
-        r = float(json.loads((log / 'metrics.json').read_text())['reward'])
-        if math.isfinite(r) and 0.0 <= r <= 1.0:
-            reward = r
-    except Exception:
-        pass
-(log / 'reward.txt').write_text(f'{reward:.12f}\n')
-PY
-exit $status
+# Task
 
+`/app/model.npz` is a small pretrained decoder-only language model (4 layers, 4 heads per layer, head dim 32, RoPE). `/app/kvmodel.py` is its numpy inference code. `/app/data/train_tokens.npy` holds 800 token sequences (512 tokens each) from the private corpus the model was trained on.
 
+Write a KV-cache eviction policy in `/app/policy.py` so that the model behaves as closely as possible to its full-cache self under a small cache budget.
 
-from __future__ import annotations
+## How the policy is run
 
-import json
-import math
-import pathlib
-import resource
-import shutil
-import sys
-import tempfile
+`TinyLM.run(tokens, policy, budget, chunk)` in `kvmodel.py` is exactly the loop the verifier uses:
 
-import numpy as np
+- sequences are processed in chunks of **32** tokens;
+- for each chunk and each layer (0..3), the chunk's queries attend to the entries still in that layer's cache plus the chunk itself (causal), the chunk's keys/values are appended, and then `policy.select(view)` returns, for every head, the indices of the entries to **keep**;
+- after the last layer of every chunk, the total number of entries over all layers and heads must be **at most 96** (the full cache reaches 8192). Heads and layers may hold different numbers of entries.
 
-import verifier_utils as vu
+The policy only selects entries; it cannot modify, merge or add keys/values. `view` is a `kvmodel.LayerView`, and its docstring lists every field. The policy is not passed token ids directly. Token identity is, however, recoverable from the cache contents with the shipped weights (for example, layer-0 keys and values depend only on the token), and using it is allowed.
 
-sys.path.insert(0, str(vu.KVREF))
-import kvcodec_baseline as kb  # noqa: E402
-import kvformat as kf  # noqa: E402
+Required interface (see the starter `/app/policy.py`):
 
-LOG_DIR = pathlib.Path('/logs/verifier')
+```python
+class EvictionPolicy:
+    def __init__(self, config: dict): ...        # d, heads, layers, head_dim, vocab, chunk, seq_len, budget, app_dir
+    def begin_sequence(self, seq_len: int): ...  # optional
+    def select(self, view) -> list[np.ndarray]:  # one int index array (or bool mask) per head
+```
 
+## Scoring
 
-def _baseline_cr(ids):
-    a = kb.Assets(vu.KVREF / 'baseline_assets.npz')
-    raw = coded = 0
-    for i in ids:
-        u = np.load(vu.HIDDEN / f'{i}.kv.npy', allow_pickle=False)
-        raw += u.size * 2
-        coded += len(kb.encode(u, a))
-    return raw / coded
+The verifier runs hidden sequences twice, once with the full cache and once with your policy. On every position after the first chunk it compares the next-token distributions using KL(full || yours).
 
+Positions are grouped by the role their token plays in the sequence:
 
-def test_reward():
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    cfg = vu.CONFIG
-    limit = float(cfg['time_limit_sec'])
-    scale = math.log(float(cfg['reward_scale_ratio']))
-    ids = vu.hidden_ids()
-    eps = kf.eps_per_channel(np.load(vu.KVREF / 'bounds.npy')).astype(np.float32)
-    eps5 = kf.from_tc(eps[None, :])                                   # (23, 2, 1, 2, 64)
+- **answer**: positions whose next token can only be predicted by recalling a specific item stated much earlier in the same sequence;
+- **filler**: positions inside ordinary running text (a text word followed by a text word);
+- **other**: all remaining positions.
 
-    vu.setup_isolation()
-    artifact_bytes = vu.artifact_size()
-    with tempfile.TemporaryDirectory(prefix='kv_grade_', dir=vu.store_dir()) as td:
-        td = pathlib.Path(td)
-        inp, e1, e2, din, dout = (td / n for n in ('in', 'e1', 'e2', 'din', 'dout'))
-        for d in (inp, e1, e2, din, dout):
-            d.mkdir()
-        for i in ids:
-            for suf in ('.kv.npy', '.pos.npy'):
-                shutil.copyfile(vu.HIDDEN / f'{i}{suf}', inp / f'{i}{suf}')
+Each hidden shard is scored as 0.45 × answer KL + 0.20 × answer top-1 agreement + 0.20 × filler KL + 0.15 × other KL. Each KL term is the mean KL over that group's positions, mapped to [0, 1] on a log scale: score 0 is roughly where generic attention-statistics policies such as heavy-hitter or observation-window eviction land, and score 1 is an idealized upper reference that a policy is not expected to reach. Top-1 agreement is the fraction of answer positions where the most likely next token under your policy matches the full cache's, mapped linearly to [0, 1] between 0.5 and 1.0.
 
-        # 1-2. encode twice into fresh directories; outputs must be byte-identical
-        t_enc1 = vu.run_codec('encode', inp, e1, limit)
-        t_enc2 = vu.run_codec('encode', inp, e2, limit)
-        want = sorted(f'{i}.bin' for i in ids)
-        assert sorted(p.name for p in e1.iterdir()) == want, 'encode.py must write exactly one <id>.bin per cache'
-        assert sorted(p.name for p in e2.iterdir()) == want, 'encode.py must write exactly one <id>.bin per cache'
-        for n in want:
-            assert (e1 / n).read_bytes() == (e2 / n).read_bytes(), f'encoding is not deterministic ({n})'
+The reward is 0.4 × the in-distribution shard + 0.6 × a shifted shard whose workload statistics differ from the training corpus (for example, more items to remember and longer gaps before they are needed).
 
-        # 3. decode the first encoding from a directory holding only .bin + positions
-        for i in ids:
-            shutil.copyfile(e1 / f'{i}.bin', din / f'{i}.bin')
-            shutil.copyfile(inp / f'{i}.pos.npy', din / f'{i}.pos.npy')
-        shutil.rmtree(inp)
-        t_dec = vu.run_codec('decode', din, dout, limit)
-        assert sorted(p.name for p in dout.iterdir()) == sorted(f'{i}.npy' for i in ids), \
-            'decode.py must write exactly one <id>.npy per input'
+The reward is continuous in [0, 1]. `python /app/evaluate_local.py` gives a quick unweighted local estimate.
 
-        raw = coded = 0
-        max_ratio = 0.0
-        for i in ids:
-            u = np.load(vu.HIDDEN / f'{i}.kv.npy', allow_pickle=False)
-            out = vu.load_decoded(dout / f'{i}.npy', u.shape)
-            err = np.abs(out - kf.bf16_to_f32(u))
-            ok = err <= eps5                                            # NaN -> False
-            assert bool(ok.all()), f'{i}: {int((~ok).sum())} decoded elements outside their bound'
-            max_ratio = max(max_ratio, float((err / eps5).max()))
-            raw += u.size * 2
-            coded += (e1 / f'{i}.bin').stat().st_size
+## Rules
 
-    cr_base = _baseline_cr(ids)
-    cr = raw / coded
-    reward = max(0.0, min(1.0, math.log(cr / cr_base) / scale))
-    assert math.isfinite(reward)
-    peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024.0
-    metrics = {
-        'artifact_bytes': artifact_bytes,
-        'hidden_caches': len(ids),
-        'raw_bytes': raw,
-        'encoded_bytes': coded,
-        'CR': cr,
-        'CR_base': cr_base,
-        'reward': reward,
-        'reward_scale_ratio': float(cfg['reward_scale_ratio']),
-        'encode_wall_sec': [t_enc1, t_enc2],
-        'decode_wall_sec': t_dec,
-        'time_limit_sec': limit,
-        'max_error_over_bound': max_ratio,
-        'near_scale_saturation': cr / cr_base > 0.95 * float(cfg['reward_scale_ratio']),
-        'peak_child_memory_mb': peak,
-    }
-    (LOG_DIR / 'metrics.json').write_text(json.dumps(metrics, indent=2, sort_keys=True) + '\n')
-    # Numeric per-metric files: scaffolds that carry verifier numbers into notes forward these
-    # (diagnostics only; the reward is unchanged).
-    per = LOG_DIR / 'per_metric'
-    per.mkdir(parents=True, exist_ok=True)
-    for name, value in (('CR', cr), ('CR_base', cr_base), ('encoded_bytes', coded),
-                        ('artifact_bytes', artifact_bytes),
-                        ('encode_wall_sec', max(t_enc1, t_enc2)), ('decode_wall_sec', t_dec),
-                        ('time_limit_sec', limit), ('artifact_limit_bytes', vu.ARTIFACT_LIMIT),
-                        ('max_error_over_bound', max_ratio)):
-        (per / f'{name}.txt').write_text(f'{float(value):.6g}\n')
+- The verifier runs your policy in a separate, unprivileged process with no network. `select` sees only what is in `view`.
+- Your policy may read any files you place under `/app` (for example, tables or parameters you precompute), but must not write files at evaluation time.
+- The total policy compute for the hidden evaluation (about 7,700 `select` calls) must stay under 20 minutes on 4 CPU cores.
+- Exceeding the budget, returning invalid indices, crashing or timing out gives reward 0.
