@@ -1,6 +1,10 @@
 # Transaction dispute outcome
 
-The file `app/solve.py` contains a simple fallback for a dispute outcome model. Replace it with a deterministic model that predicts the final refund fraction for each dispute case.
+## Objective
+
+Predict the final refund fraction for each dispute case, a continuous value between 0 and 1. The objective is to minimize root mean squared error (RMSE) between predicted and actual refund fractions.
+
+The file `app/solve.py` contains a simple fallback for the model. Replace it with a deterministic implementation.
 
 Each case has case-level features, a packed set of parties, and a packed set of evidence events. Parties have role/category codes. Events have event/source/document codes, numeric evidence fields, and local party routing indices. The target is a continuous refund fraction between 0 and 1.
 
