@@ -1,82 +1,52 @@
-LLM inference and serving
+# Transaction dispute outcome
 
-★ Multi-model routing / cascades (choosing a model under a cost budget)
-★ Sampled-answer aggregation (best-of-N, majority voting, weighted voting)
-★ Test-time compute allocation (how many samples per problem, when to stop)
-Early exit / layer skipping policies
-Semantic cache / prefix cache admission and eviction
-Output length prediction
-Constrained decoding / structured output (JSON, grammar constraints)
-Batch packing and padding optimization for inference
-Serving-side scheduling and swapping of LoRA adapters
+The file `app/solve.py` contains a simple fallback for a dispute outcome model. Replace it with a deterministic model that predicts the final refund fraction for each dispute case.
 
-Model compression
+Each case has case-level features, a packed set of parties, and a packed set of evidence events. Parties have role/category codes. Events have event/source/document codes, numeric evidence fields, and local party routing indices. The target is a continuous refund fraction between 0 and 1.
 
-★ Low-bit compression of retrieval embeddings
-Structured pruning / low-rank factorization
-Weight quantization (mixed precision, codebook quantization)
-Activation outlier handling (rotation, smoothing)
-Vocabulary pruning / embedding table compression
-Data and loss design for knowledge distillation
+Implement these functions in `app/solve.py`:
 
-Training and optimization
+```python
+def fit_dispute_model(
+    train_case_X,
+    train_party_X,
+    train_party_code,
+    train_event_X,
+    train_event_code,
+    train_event_party,
+    train_party_offsets,
+    train_event_offsets,
+    train_y,
+):
+    ...
 
-★ Learning-curve extrapolation / early stopping
-★ Scaling-law extrapolation
-Learning-rate schedule design
-Data mixture optimization
-Curriculum learning / sample ordering
-Gradient compression (distributed communication)
-Loss-scaling strategy in mixed-precision training
-Checkpoint averaging / EMA strategy
 
-Data-centric
+def predict_dispute_outcome(
+    case_X,
+    party_X,
+    party_code,
+    event_X,
+    event_code,
+    event_party,
+    party_offsets,
+    event_offsets,
+    params,
+):
+    ...
+```
 
-★ Weak-supervision label aggregation
-★ Noisy-label detection and cleaning
-Active-learning acquisition strategy
-Data deduplication (near-duplicate detection)
-Benchmark contamination detection
-Synthetic-data filtering (quality scoring of LLM-generated data)
-Data-augmentation policy search
+`party_offsets` and `event_offsets` use the usual packed-array convention: entries for case `i` are in `[offsets[i], offsets[i+1])`. `event_party[:, 0]` and `event_party[:, 1]` are local party indices within the case; `-1` means that side is not attached to a known party.
 
-Evaluation and reliability
+## Grading environment
 
-★ Selective answering / abstention for LLMs
-Hallucination detection (from logprobs or sample consistency)
-Uncertainty calibration (classifiers, OOD)
-OOD detection
-Distribution-shift detection
-Statistical tests for model comparison / confidence intervals for small-sample evaluation
+The grader runs in a **fresh image**, not the development environment. At grading time, **only the following three project files** are carried into `/app`:
 
-Representation and interpretability
+- `/app/solve.py`
+- `/app/train_data.npz`
+- `/app/public_eval.npz`
 
-★ Predicting model performance from weights (weight-space learning)
-Concept erasure (the A3 direction)
-Sparse dictionary / SAE feature recovery (the A1 direction)
-Probing design
-Representation alignment between models (stitching, CKA)
-Steering-vector construction
+Only the Python packages **preinstalled in the grading image** are available. No other project files from the development environment are carried over, including custom helper modules, saved models or checkpoints, caches, and generated artifacts. Do not rely on additional local files, installing packages, or network access.
 
-Retrieval and RAG
+Keep all code needed for fitting and predicting inside `app/solve.py`. If your method learns model state, construct that state inside `fit_dispute_model` using the supplied training arrays, return it through `params`, and use those returned parameters in `predict_dispute_outcome`. Do not expect a separately saved model file to persist into grading.
 
-Reranking strategy for retrieval results
-Document chunking strategy
-Query rewriting / expansion
-Hybrid retrieval score fusion (BM25 + dense)
-Retrieval corpus pruning (which documents to keep in a fixed-size index)
-
-Systems and compilers
-
-Cross-hardware transfer of compiler cost models (the C1 direction)
-Operator fusion / schedule search
-Memory planning (which layers get activation checkpointing)
-Partitioning strategy for pipeline parallelism
-Tensor layout / memory allocation
-
-RL and agents
-
-Offline RL (learning a policy from logs)
-Reward-model learning from noisy preferences
-Preference-data selection (which pairs to use for DPO)
-Tool-call planning and budget allocation for agents
+Predictions must be finite, deterministic, one-dimensional, and have shape `(n_cases,)`. Do not mutate input arrays.
