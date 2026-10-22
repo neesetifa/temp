@@ -1,45 +1,45 @@
-# Transaction dispute outcome
+# Inspection event risk
 
 ## Objective
 
-Predict the final refund fraction for each dispute case, a continuous value between 0 and 1. The objective is to minimize root mean squared error (RMSE) between predicted and actual refund fractions.
+Predict the future continuous risk value for each entity from its prior inspection-like event history. Larger risk values indicate more severe future outcomes. The objective is to minimize root mean squared error (RMSE) between predicted and actual risk values.
 
-The file `app/solve.py` contains a simple fallback for the model. Replace it with a deterministic implementation.
+The current model in `app/solve.py` is a weak fallback. Replace it with a stronger deterministic model.
 
-Each case has case-level features, a packed set of parties, and a packed set of evidence events. Parties have role/category codes. Events have event/source/document codes, numeric evidence fields, and local party routing indices. The target is a continuous refund fraction between 0 and 1.
-
-Implement these functions in `app/solve.py`:
+Implement these two functions in `app/solve.py`:
 
 ```python
-def fit_dispute_model(
-    train_case_X,
-    train_party_X,
-    train_party_code,
-    train_event_X,
+def fit_inspection_model(
+    train_entity_X,
+    train_entity_code,
+    train_event_time,
     train_event_code,
-    train_event_party,
-    train_party_offsets,
-    train_event_offsets,
+    train_event_value,
+    train_entity_offsets,
     train_y,
 ):
     ...
 
 
-def predict_dispute_outcome(
-    case_X,
-    party_X,
-    party_code,
-    event_X,
+def predict_inspection_risk(
+    entity_X,
+    entity_code,
+    event_time,
     event_code,
-    event_party,
-    party_offsets,
-    event_offsets,
+    event_value,
+    entity_offsets,
     params,
 ):
     ...
 ```
 
-`party_offsets` and `event_offsets` use the usual packed-array convention: entries for case `i` are in `[offsets[i], offsets[i+1])`. `event_party[:, 0]` and `event_party[:, 1]` are local party indices within the case; `-1` means that side is not attached to a known party.
+## Data
+
+`entity_X` is a numeric matrix with one row per entity. `entity_code` is an integer-coded matrix with one row per entity. The event arrays are packed across all entities, and `entity_offsets[i]:entity_offsets[i+1]` gives the history rows for entity `i`.
+
+`event_time` gives the event time relative to the prediction point. The histories are ordered within each entity. `event_code` gives the event type. `event_value` contains numeric measurements attached to each event.
+
+`train_y` is the future risk value for each training entity. The `public_eval.npz` file includes labeled examples for local sanity checks.
 
 ## Runtime and file availability
 
@@ -51,6 +51,10 @@ The solution runs in a fresh, isolated Python environment. The only project file
 
 Only preinstalled Python packages are available. Other project files and development artifacts are not present, including custom helper modules, saved models, checkpoints, and caches. The solution must not require additional local files, package installation, or network access.
 
-Keep all code needed for fitting and prediction in `app/solve.py`. Build any learned model state inside `fit_dispute_model` using the supplied training arrays, return it as `params`, and use those parameters in `predict_dispute_outcome`. Do not rely on separately saved model files.
+Keep all code needed for fitting and prediction in `app/solve.py`. Build any learned model state inside `fit_inspection_model` using the supplied training arrays, return it as `params`, and use those parameters in `predict_inspection_risk`. Do not rely on separately saved model files.
 
-Predictions must be finite, deterministic, one-dimensional, and have shape `(n_cases,)`. Do not mutate input arrays.
+## Notes
+
+Simple averages, last-event rules, or category-only fallbacks are intentionally weak. Useful signal can come from event order, event type, numeric event values, recency, repeated patterns, gaps between events, and short-history fallbacks.
+
+Your predictions must be a one-dimensional finite NumPy-compatible array of shape `(n_entities,)`. The functions must be deterministic and must not mutate any input arrays. Do not read files beyond the available inputs, use the network, or depend on external data.
