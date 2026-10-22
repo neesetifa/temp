@@ -37,16 +37,16 @@ def predict_dispute_outcome(
 
 `party_offsets` and `event_offsets` use the usual packed-array convention: entries for case `i` are in `[offsets[i], offsets[i+1])`. `event_party[:, 0]` and `event_party[:, 1]` are local party indices within the case; `-1` means that side is not attached to a known party.
 
-## Grading environment
+## Runtime and file availability
 
-The grader runs in a **fresh image**, not the development environment. At grading time, **only the following three project files** are carried into `/app`:
+The solution runs in a fresh, isolated Python environment. The only project files available under `/app` are:
 
 - `/app/solve.py`
 - `/app/train_data.npz`
 - `/app/public_eval.npz`
 
-Only the Python packages **preinstalled in the grading image** are available. No other project files from the development environment are carried over, including custom helper modules, saved models or checkpoints, caches, and generated artifacts. Do not rely on additional local files, installing packages, or network access.
+Only preinstalled Python packages are available. Other project files and development artifacts are not present, including custom helper modules, saved models, checkpoints, and caches. The solution must not require additional local files, package installation, or network access.
 
-Keep all code needed for fitting and predicting inside `app/solve.py`. If your method learns model state, construct that state inside `fit_dispute_model` using the supplied training arrays, return it through `params`, and use those returned parameters in `predict_dispute_outcome`. Do not expect a separately saved model file to persist into grading.
+Keep all code needed for fitting and prediction in `app/solve.py`. Build any learned model state inside `fit_dispute_model` using the supplied training arrays, return it as `params`, and use those parameters in `predict_dispute_outcome`. Do not rely on separately saved model files.
 
 Predictions must be finite, deterministic, one-dimensional, and have shape `(n_cases,)`. Do not mutate input arrays.
