@@ -550,13 +550,6 @@ def test_release_passes_pipeline_validation():
 
 # ===== END FILE: tmp/environment/tests/test_public.py =====
 
-# ===== BEGIN FILE: tmp/solution/solve.sh =====
-#!/bin/bash
-cp /solution/model.json /app/release/model.json
-cp /solution/policy.json /app/release/policy.json
-
-# ===== END FILE: tmp/solution/solve.sh =====
-
 # ===== BEGIN FILE: tmp/tests/Dockerfile =====
 FROM python:3.11-slim
 RUN pip install --no-cache-dir numpy==2.2.6
@@ -656,6 +649,23 @@ def load_hidden():
     return anchors, wmeta
 
 
+def load_window(path):
+    """compact integer encoding -> float features (NaN restored), amounts, timestamps"""
+    z = np.load(path, allow_pickle=False)
+    dec = z["dec"].astype(np.float64)
+    nf = len(dec)
+    X = np.empty((len(z["y"]), nf), np.float64)
+    for j in range(nf):
+        c = z[f"x{j:02d}"]
+        col = c.astype(np.float64) / 10.0 ** dec[j]
+        col[c == np.iinfo(c.dtype).min] = np.nan
+        X[:, j] = col
+    return dict(X=X, ts=z["ts_off"].astype(np.int64) + int(z["ts_base"]),
+                amount_usd_true=z["amount_cents"].astype(np.float64) / 100.0, y=z["y"], loss_flag=z["loss_flag"],
+                p_catch=z["p_catch_milli"].astype(np.float64) / 1000.0, rev_u=z["rev_u16"].astype(np.float64) / 65536.0,
+                day=z["day"])
+
+
 def group_costs(act, W, margin):
     amt = W["amount_usd_true"].astype(np.float64)
     v = W["X"][:, RE.FEATURES.index("vertical")].astype(np.int64)
@@ -698,8 +708,7 @@ def main():
     except (RE.ArtifactError, OSError) as e:
         metrics["status"] = f"rejected: {str(e)[:300]}"
         return write_out(0.0, metrics)
-    z = np.load(os.path.join(TESTS, "hidden", "window_futB.npz"), allow_pickle=False)
-    W = {k: z[k] for k in z.files}
+    W = load_window(os.path.join(TESTS, "hidden", "window_futB.npz"))
     s = RE.score(model, W["X"])
     act = RE.decide(s, W["X"], W["ts"], policy, wmeta["capacity_per_pt_hour"])
     margin = np.array([wmeta["lost_margin_rate"][v] for v in RE.VERTICALS])
@@ -1180,5 +1189,4 @@ print(f"{len(results) - len(bad)}/{len(results)} passed")
 sys.exit(1 if bad else 0)
 
 # ===== END FILE: tmp/tests/test_security.py =====
-
 
