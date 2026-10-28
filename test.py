@@ -1,73 +1,48 @@
-# Consolidate six task models into one before on-device deployment
+PROBLEM
+LLM serving engines reuse the KV cache of shared prompt prefixes, in 512-token blocks. A request
+reuses a block only if every block before it is cached too, so a hit is the longest fully cached
+prefix. Memory holds a few thousand blocks: the engine must decide what to admit and evict.
 
-A product ships six small classifiers, one per task, all fine-tuned by different teams from the
-same pretrained **base** network. The next device release has room for only **one** network of
-the base's size. Your job is to build that single **merged model**: one shared trunk with six
-task heads. Once it ships, it replaces all six task models on the device, so each head has to
-reproduce its original model's predictions as faithfully as possible.
+The workloads come from real one-hour production traces of a commercial LLM service (the public
+Mooncake FAST'25 release: a chat workload and a tool/agent workload). Each request has an arrival
+timestamp (3 s grid), its input token count, and the chain of block hashes of its prompt; equal
+hashes mean equal prefixes. No text is included. Development and graded traces are independent
+~29-minute draws from a generator fitted to the real second half hour: it keeps the real shared
+prompt prefixes and arrival patterns and resamples conversations from real ones, so no draw replays
+any real request sequence. The agent gets 3 dev draws per workload; grading uses 2 secret draws per
+workload at four capacities (about 460 to 3,750 blocks).
 
-## What you have
+Write an online policy. For each request, in arrival order, the simulator computes the hit, then
+calls the policy with the request and its hit length; the policy returns which of the request's
+blocks to admit and which resident blocks to evict. The simulator owns the cache and enforces the
+capacity; the policy never sees future requests. The policy may keep state and ship artifacts
+(e.g. a model fitted on the dev draws).
 
-All files are in `/app/data`:
+REWARD
+For each graded cell c (2 workloads x 2 draws x 4 capacities = 16):
+  h_c   = hit blocks / total prompt blocks under the submitted policy
+  L_c   = the same quantity under LRU (vLLM default; deeper blocks of a request evicted first)
+  B_c   = the same quantity under Belady's offline optimum (furthest next use, bypass allowed,
+          ties broken deeper-block-first; the resulting cache is always ancestor-closed, so B_c
+          is an upper bound on any policy's prefix hits)
+  g_c   = (h_c - L_c) / (B_c - L_c)
+L_c and B_c are recomputed by the verifier at grading time on the same graded draw.
+Graded draws: chat ~6,300 requests / ~140,000 prompt blocks; tool-agent ~12,300 requests /
+~205,000 prompt blocks each.
+G = mean of g_c over the 16 cells (g_c may be negative; it is not clipped per cell).
+reward = clamp(G / 0.40, 0, 1)
+Hard-gated to 0: any protocol violation (evicting a non-resident block, admitting a block not in
+the current request, exceeding capacity after a step), a crash, exceeding the per-cell CPU budget, a
+nondeterministic result (one cell is replayed twice and must match exactly), or a malformed return.
 
-| file | content |
-|---|---|
-| `base.npz` | the pretrained base trunk (`W1 b1 W2 b2 W3 b3`) |
-| `expert_{k}.npz` | task model k (k = 0..5): trunk + `head_W (64,10)`, `head_b (10,)` |
-| `unlabeled_inputs.npz` | `task_{k}`: **64 inputs logged from task k's production traffic** |
-
-There are no labels and no other data. The input distribution of each task's traffic over R^48 is
-unknown, and some tasks may share the same input distribution. The 64 logged inputs per task
-are all you have from it, but you can run the six task models (and the base) on any input you
-like.
-
-The six task models started from the base, but not all from the same export of it. Some teams
-fine-tuned from a re-exported copy whose neurons are stored in a different order. That copy
-computes exactly the same function as the base, but its weights are not directly aligned with
-the base or with each other.
-
-## Architecture
-
-The base, the task models and the merged model share the trunk shape (see `/app/mlp.py`):
-
-```
-x (48) -> ReLU(x W1 + b1) (64) -> ReLU(. W2 + b2) (64) -> ReLU(. W3 + b3) (64) = h
-task model k : logits = h @ head_W + head_b                       (10 classes)
-merged model : logits_k = h @ HW[k] + Hb[k]   for task k = 0..5    (one trunk, six heads)
-```
-
-## What matters
-
-The merged model will serve the same production traffic the 64 logged inputs came from, i.e. many
-more inputs from each task's real input distribution. For task k, what counts is how closely head
-k matches task model k on that traffic, measured as the mean **KL(task_model_k(x) ‖ merged
-head k(x))** over the softmax outputs, averaged over task k's real inputs. Lower is better.
-
-All six tasks ship together, so the release is only as good as its weakest head. A head that is
-far off its task model on its traffic (for example an untrained head, or one task model's weights
-reused for every task) breaks that product feature, however good the other five heads are. A
-release whose six heads are all close to their task models beats one with five excellent heads
-and one poor one. Getting the divergence down on every task, relative to how hard that task is,
-is the goal.
-
-Tools in `/app`:
-
-- `mlp.py`: loaders, the forward pass, the KL divergence above, a gradient for the merged model and
-  Adam, all in numpy. You may install and use anything else, e.g. torch.
-- `make_merged.py`: a working but weak starting point (naive weight averaging).
-- `evaluate.py`: reports each task's mean KL on the 64 logged inputs. If you train on those inputs,
-  this number is optimistic, so hold some out for an honest estimate of how the model will do on
-  real traffic.
-- `tests/test_public.py`: checks that your file loads in the deployment format.
-
-## Deliverable
-
-The device build pipeline loads **`/app/merged.npz`**, which must contain these float arrays:
-`W1 (48,64) b1 (64,) W2 (64,64) b2 (64,) W3 (64,64) b3 (64,) HW (6,64,10) Hb (6,10)`, all finite.
-The pipeline ignores any other arrays in the file and never reads them. The file itself must be
-a regular file of at most 20 MB. `mlp.save_merged()` writes the right format. The pipeline cannot
-ship a file with missing arrays, wrong shapes or dtypes, NaN/inf values or pickled objects, or a
-file that is a symlink or larger than 20 MB.
-
-Only the weights file ships; none of your code runs on the device. You can spend your own
-session's compute on producing it.
+CONSTRAINTS
+Interface: policy.py defines class Policy(capacity: int) with step(request: dict, hit_blocks: int) -> (admit: list[int], evict: list[int]).
+The request dict has timestamp_ms, input_length, hash_ids; nothing else is provided (no output length).
+The policy runs in a separate process fed one request at a time; it cannot see future requests or the graded trace file.
+CPU only: 1 core, 4 GB RAM, 600 s CPU time per graded cell (enforced with RLIMIT_CPU, not wall clock).
+Python 3 with numpy, scipy, scikit-learn available; no other packages.
+Submission directory at most 50 MB, including any fitted artifacts.
+The sandbox has internet access. The public source traces give no information about the secret
+graded draws beyond what the dev draws show; downloading trace data is still forbidden by rubric.
+The policy must be deterministic (fixed seeds) and must not depend on the wall clock.
+Capacity is passed to the constructor; the same code must handle every capacity.
